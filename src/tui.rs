@@ -41,6 +41,7 @@ use crate::{
     config::Config,
     db::{Database, ImageRecord},
     filter::{ColourFilter, FilterSpecV1},
+    filter_completion::{FilterJsonCompletion, filter_json_completions},
     model,
     move_files::{MovePlan, apply_move, plan_move},
     scan::{ScanEvent, ScanOptions, ScanReport, scan_catalog_with_progress},
@@ -217,6 +218,12 @@ struct FilterEditor {
     save_name: Option<String>,
     error: Option<String>,
     notice: Option<String>,
+    completions: Option<FilterCompletionState>,
+}
+
+struct FilterCompletionState {
+    items: Vec<FilterJsonCompletion>,
+    selected: usize,
 }
 
 impl FilterEditor {
@@ -236,6 +243,7 @@ impl FilterEditor {
             save_name: None,
             error: None,
             notice: None,
+            completions: None,
         }
     }
 
@@ -251,6 +259,7 @@ impl FilterEditor {
         self.scroll_line = 0;
         self.scroll_column = 0;
         self.error = None;
+        self.completions = None;
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> FilterEditorCommand {
@@ -258,11 +267,60 @@ impl FilterEditor {
             return self.handle_save_name_key(key);
         }
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        if self.completions.is_some() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.completions = None;
+                    return FilterEditorCommand::Continue;
+                }
+                KeyCode::Up => {
+                    self.select_previous_completion();
+                    return FilterEditorCommand::Continue;
+                }
+                KeyCode::Down => {
+                    self.select_next_completion();
+                    return FilterEditorCommand::Continue;
+                }
+                KeyCode::PageUp | KeyCode::BackTab => {
+                    self.move_completion_selection(-5);
+                    return FilterEditorCommand::Continue;
+                }
+                KeyCode::PageDown => {
+                    self.move_completion_selection(5);
+                    return FilterEditorCommand::Continue;
+                }
+                KeyCode::Enter | KeyCode::Tab => {
+                    self.accept_completion();
+                    return FilterEditorCommand::Continue;
+                }
+                KeyCode::Char(' ') | KeyCode::Null if control => {
+                    self.open_completions();
+                    return FilterEditorCommand::Continue;
+                }
+                _ => {}
+            }
+        }
+        if control
+            && self.focus == FilterEditorFocus::Document
+            && matches!(key.code, KeyCode::Char(' ') | KeyCode::Null)
+        {
+            self.open_completions();
+            return FilterEditorCommand::Continue;
+        }
         match key.code {
             KeyCode::Esc => FilterEditorCommand::Cancel,
-            KeyCode::Char('s' | 'S') if control => FilterEditorCommand::Apply,
-            KeyCode::Enter if control => FilterEditorCommand::Apply,
-            KeyCode::Char('r' | 'R') if control => FilterEditorCommand::Reset,
+            KeyCode::Char('s' | 'S') if control => {
+                self.completions = None;
+                FilterEditorCommand::Apply
+            }
+            KeyCode::Enter if control => {
+                self.completions = None;
+                FilterEditorCommand::Apply
+            }
+            KeyCode::Char('r' | 'R') if control => {
+                self.completions = None;
+                FilterEditorCommand::Reset
+            }
             KeyCode::Char('p' | 'P') if control => {
                 self.begin_save_preset();
                 FilterEditorCommand::Continue
@@ -273,6 +331,7 @@ impl FilterEditor {
                     FilterEditorFocus::Presets => FilterEditorFocus::Document,
                 };
                 self.error = None;
+                self.completions = None;
                 FilterEditorCommand::Continue
             }
             _ if self.focus == FilterEditorFocus::Presets => self.handle_preset_key(key),
@@ -280,12 +339,14 @@ impl FilterEditor {
                 self.cursor_line = 0;
                 self.cursor_column = 0;
                 self.preferred_column = None;
+                self.completions = None;
                 FilterEditorCommand::Continue
             }
             KeyCode::End if control => {
                 self.cursor_line = self.lines.len() - 1;
                 self.cursor_column = self.current_line_len();
                 self.preferred_column = None;
+                self.completions = None;
                 FilterEditorCommand::Continue
             }
             KeyCode::Left => {
@@ -315,11 +376,13 @@ impl FilterEditor {
             KeyCode::Home => {
                 self.cursor_column = 0;
                 self.preferred_column = None;
+                self.completions = None;
                 FilterEditorCommand::Continue
             }
             KeyCode::End => {
                 self.cursor_column = self.current_line_len();
                 self.preferred_column = None;
+                self.completions = None;
                 FilterEditorCommand::Continue
             }
             KeyCode::Backspace => {
@@ -401,6 +464,7 @@ impl FilterEditor {
         self.save_name = Some(existing_name);
         self.error = None;
         self.notice = None;
+        self.completions = None;
     }
 
     fn handle_save_name_key(&mut self, key: KeyEvent) -> FilterEditorCommand {
@@ -481,6 +545,11 @@ impl FilterEditor {
         self.lines[self.cursor_line].insert(byte_index, character);
         self.cursor_column += 1;
         self.changed();
+        if character.is_alphanumeric() || matches!(character, '"' | '_' | '-' | '.' | '#' | '/') {
+            self.refresh_completions();
+        } else {
+            self.completions = None;
+        }
     }
 
     fn insert_newline(&mut self) {
@@ -490,6 +559,7 @@ impl FilterEditor {
         self.lines.insert(self.cursor_line, remainder);
         self.cursor_column = 0;
         self.changed();
+        self.completions = None;
     }
 
     fn backspace(&mut self) {
@@ -498,12 +568,14 @@ impl FilterEditor {
             let byte_index = char_to_byte_index(&self.lines[self.cursor_line], self.cursor_column);
             self.lines[self.cursor_line].remove(byte_index);
             self.changed();
+            self.refresh_completions();
         } else if self.cursor_line > 0 {
             let current = self.lines.remove(self.cursor_line);
             self.cursor_line -= 1;
             self.cursor_column = self.current_line_len();
             self.lines[self.cursor_line].push_str(&current);
             self.changed();
+            self.refresh_completions();
         }
     }
 
@@ -512,10 +584,12 @@ impl FilterEditor {
             let byte_index = char_to_byte_index(&self.lines[self.cursor_line], self.cursor_column);
             self.lines[self.cursor_line].remove(byte_index);
             self.changed();
+            self.refresh_completions();
         } else if self.cursor_line + 1 < self.lines.len() {
             let next = self.lines.remove(self.cursor_line + 1);
             self.lines[self.cursor_line].push_str(&next);
             self.changed();
+            self.refresh_completions();
         }
     }
 
@@ -527,6 +601,7 @@ impl FilterEditor {
             self.cursor_column = self.current_line_len();
         }
         self.preferred_column = None;
+        self.completions = None;
     }
 
     fn move_right(&mut self) {
@@ -537,6 +612,7 @@ impl FilterEditor {
             self.cursor_column = 0;
         }
         self.preferred_column = None;
+        self.completions = None;
     }
 
     fn move_vertical(&mut self, amount: isize) {
@@ -547,6 +623,7 @@ impl FilterEditor {
             .min(self.lines.len() - 1);
         self.cursor_column = preferred.min(self.current_line_len());
         self.preferred_column = Some(preferred);
+        self.completions = None;
     }
 
     fn page_size(&self) -> isize {
@@ -561,6 +638,99 @@ impl FilterEditor {
         self.preferred_column = None;
         self.error = None;
         self.notice = None;
+    }
+
+    fn open_completions(&mut self) {
+        self.refresh_completions();
+        if self.completions.is_none() {
+            self.notice = Some("No FilterSpecV1 completions are available here.".into());
+        } else {
+            self.notice = None;
+            self.error = None;
+        }
+    }
+
+    fn refresh_completions(&mut self) {
+        let items = filter_json_completions(&self.value(), self.cursor_offset());
+        if items.is_empty() {
+            self.completions = None;
+            return;
+        }
+        let selected = self
+            .completions
+            .as_ref()
+            .map_or(0, |completion| completion.selected.min(items.len() - 1));
+        self.completions = Some(FilterCompletionState { items, selected });
+    }
+
+    fn select_previous_completion(&mut self) {
+        if let Some(completions) = &mut self.completions {
+            completions.selected = completions
+                .selected
+                .checked_sub(1)
+                .unwrap_or(completions.items.len() - 1);
+        }
+    }
+
+    fn select_next_completion(&mut self) {
+        if let Some(completions) = &mut self.completions {
+            completions.selected = (completions.selected + 1) % completions.items.len();
+        }
+    }
+
+    fn move_completion_selection(&mut self, amount: isize) {
+        if let Some(completions) = &mut self.completions {
+            completions.selected = completions
+                .selected
+                .saturating_add_signed(amount)
+                .min(completions.items.len() - 1);
+        }
+    }
+
+    fn accept_completion(&mut self) {
+        let Some(completion) = self
+            .completions
+            .as_ref()
+            .and_then(|completions| completions.items.get(completions.selected).cloned())
+        else {
+            self.completions = None;
+            return;
+        };
+        let mut value = self.value();
+        let start = char_to_byte_index(&value, completion.replace_start);
+        let end = char_to_byte_index(&value, completion.replace_end);
+        value.replace_range(start..end, &completion.replacement);
+        let cursor = completion.replace_start + completion.cursor_after;
+        self.lines = value.split('\n').map(str::to_owned).collect();
+        self.set_cursor_offset(cursor);
+        self.completions = None;
+        self.preferred_column = None;
+        self.error = None;
+        self.notice = Some(format!("Inserted {}.", completion.label));
+    }
+
+    fn cursor_offset(&self) -> usize {
+        self.lines
+            .iter()
+            .take(self.cursor_line)
+            .map(|line| line.chars().count() + 1)
+            .sum::<usize>()
+            + self.cursor_column
+    }
+
+    fn set_cursor_offset(&mut self, offset: usize) {
+        let mut remaining = offset;
+        for (line_index, line) in self.lines.iter().enumerate() {
+            let length = line.chars().count();
+            if remaining <= length {
+                self.cursor_line = line_index;
+                self.cursor_column = remaining;
+                return;
+            }
+            remaining = remaining.saturating_sub(length + 1);
+        }
+        self.cursor_line = self.lines.len() - 1;
+        self.cursor_column = self.current_line_len();
     }
 
     fn ensure_cursor_visible(&mut self, width: usize, height: usize) {
@@ -2130,7 +2300,7 @@ fn render_modal(frame: &mut Frame<'_>, app: &mut App) {
             frame.render_widget(Clear, area);
             frame.render_widget(
                 Paragraph::new(
-                    "Keyboard\n\n↑/↓, j/k    navigate\n:            run any bgm CLI command\n/            filter examples, presets, and JSON\nf/t/c        favorite, tag, collections\nm/w/s        move, wpaperd binding, background scan\no or Enter   open with xdg-open\nq            quit\n\nCommand palette\nTab / ↑/↓    complete / choose suggestion\nCtrl+P/N     previous / next command in history\n←/→ Home End edit; Ctrl+W deletes a word\nEnter runs in background; Esc closes\n\nFilter editor\nTab / ↑/↓    switch pane / choose preset\nEnter loads preset or inserts a JSON line\nCtrl+P       save JSON as a named preset\nCtrl+S/R     apply / reset filter\nEsc          cancel\n\nPress any key to close.",
+                    "Keyboard\n\n↑/↓, j/k    navigate\n:            run any bgm CLI command\n/            filter examples, presets, and JSON\nf/t/c        favorite, tag, collections\nm/w/s        move, wpaperd binding, background scan\no or Enter   open with xdg-open\nq            quit\n\nCommand palette\nTab / ↑/↓    complete / choose suggestion\nCtrl+P/N     previous / next command in history\n←/→ Home End edit; Ctrl+W deletes a word\nEnter runs in background; Esc closes\n\nFilter editor\nCtrl+Space   show JSON IntelliSense\nTab / ↑/↓    accept / choose suggestion when open\nEnter accepts suggestion or inserts a line\nCtrl+P       save JSON as a named preset\nCtrl+S/R     apply / reset filter\nEsc          close suggestions, then cancel\n\nPress any key to close.",
                 )
                 .wrap(Wrap { trim: false })
                 .block(Block::default().borders(Borders::ALL).title(" Help ")),
@@ -2558,12 +2728,16 @@ fn render_filter_editor(frame: &mut Frame<'_>, editor: &mut FilterEditor) {
     } else {
         Span::styled(location, Style::default().fg(Color::DarkGray))
     };
-    let focus_help = match editor.focus {
-        FilterEditorFocus::Document => {
-            "JSON: arrows move • Enter inserts a line • Tab selects presets"
-        }
-        FilterEditorFocus::Presets => {
-            "Presets: ↑/↓ choose • Enter loads • s saves • Tab edits JSON"
+    let focus_help = if editor.completions.is_some() {
+        "IntelliSense: ↑/↓ choose • Tab/Enter accept • Ctrl+Space refresh • Esc closes"
+    } else {
+        match editor.focus {
+            FilterEditorFocus::Document => {
+                "JSON: arrows move • Enter new line • Ctrl+Space IntelliSense • Tab presets"
+            }
+            FilterEditorFocus::Presets => {
+                "Presets: ↑/↓ choose • Enter loads • s saves • Tab edits JSON"
+            }
         }
     };
     frame.render_widget(
@@ -2576,7 +2750,7 @@ fn render_filter_editor(frame: &mut Frame<'_>, editor: &mut FilterEditor) {
         sections[2],
     );
 
-    if editor.focus == FilterEditorFocus::Document
+    let cursor_position = if editor.focus == FilterEditorFocus::Document
         && editor.save_name.is_none()
         && content_width > 0
         && editor_area.height > 0
@@ -2596,6 +2770,16 @@ fn render_filter_editor(frame: &mut Frame<'_>, editor: &mut FilterEditor) {
             editor_area.x + gutter_width + cursor_x,
             editor_area.y + cursor_y,
         ));
+        Some((
+            editor_area.x + gutter_width + cursor_x,
+            editor_area.y + cursor_y,
+        ))
+    } else {
+        None
+    };
+
+    if let (Some(completions), Some(cursor)) = (&editor.completions, cursor_position) {
+        render_filter_completions(frame, completions, cursor, editor_area);
     }
 
     if let Some(name) = &editor.save_name {
@@ -2627,6 +2811,65 @@ fn render_filter_editor(frame: &mut Frame<'_>, editor: &mut FilterEditor) {
             prompt_inner.y + 2,
         ));
     }
+}
+
+fn render_filter_completions(
+    frame: &mut Frame<'_>,
+    completions: &FilterCompletionState,
+    cursor: (u16, u16),
+    editor_area: Rect,
+) {
+    if editor_area.width < 4 || editor_area.height < 3 {
+        return;
+    }
+    let width = 54_u16.min(editor_area.width);
+    let height = u16::try_from(completions.items.len().min(6) + 2)
+        .unwrap_or(u16::MAX)
+        .min(editor_area.height)
+        .max(3);
+    let x = cursor
+        .0
+        .min(editor_area.right().saturating_sub(width))
+        .max(editor_area.x);
+    let below = cursor.1.saturating_add(1);
+    let y = if below.saturating_add(height) <= editor_area.bottom() {
+        below
+    } else {
+        cursor.1.saturating_sub(height).max(editor_area.y)
+    };
+    let area = Rect::new(x, y, width, height);
+    frame.render_widget(Clear, area);
+    let items = completions
+        .items
+        .iter()
+        .map(|completion| {
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{:<20}", completion.label),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::raw(completion.description.clone()),
+            ]))
+        })
+        .collect::<Vec<_>>();
+    let mut state = ListState::default().with_selected(Some(completions.selected));
+    frame.render_stateful_widget(
+        List::new(items)
+            .highlight_symbol("▸ ")
+            .highlight_style(
+                Style::default()
+                    .bg(Color::Rgb(35, 48, 65))
+                    .add_modifier(Modifier::BOLD),
+            )
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title(" Filter IntelliSense "),
+            ),
+        area,
+        &mut state,
+    );
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -2788,6 +3031,84 @@ mod tests {
 
         assert_eq!(editor.value(), "{\n  \"tags\": [\"café\"]\n}");
         assert_eq!((editor.cursor_line, editor.cursor_column), (2, 1));
+    }
+
+    #[test]
+    fn filter_editor_completes_contextual_enum_values() {
+        let mut editor = FilterEditor::new(r#"{"orientations": []}"#.into(), Vec::new());
+        editor.cursor_column = editor.lines[0]
+            .chars()
+            .position(|character| character == '[')
+            .expect("array")
+            + 1;
+
+        assert!(matches!(
+            press_control(&mut editor, KeyCode::Char(' ')),
+            FilterEditorCommand::Continue
+        ));
+        let completions = editor.completions.as_ref().expect("completion popup");
+        assert_eq!(
+            completions
+                .items
+                .iter()
+                .map(|completion| completion.label.as_str())
+                .collect::<Vec<_>>(),
+            ["landscape", "portrait", "square"]
+        );
+
+        press(&mut editor, KeyCode::Down);
+        press(&mut editor, KeyCode::Enter);
+
+        assert_eq!(editor.value(), r#"{"orientations": ["portrait"]}"#);
+        assert!(editor.completions.is_none());
+        assert_eq!(editor.notice.as_deref(), Some("Inserted portrait."));
+    }
+
+    #[test]
+    fn filter_editor_filters_completions_as_the_user_types() {
+        let mut editor = FilterEditor::new(r#"{"light_dark": [""]}"#.into(), Vec::new());
+        editor.cursor_column = editor.lines[0].rfind('"').expect("closing string");
+
+        press(&mut editor, KeyCode::Char('d'));
+
+        let completions = editor.completions.as_ref().expect("filtered popup");
+        assert_eq!(completions.items.len(), 1);
+        assert_eq!(completions.items[0].label, "dark");
+        press(&mut editor, KeyCode::Tab);
+        assert_eq!(editor.value(), r#"{"light_dark": ["dark"]}"#);
+        assert_eq!(editor.focus, FilterEditorFocus::Document);
+    }
+
+    #[test]
+    fn escape_closes_filter_intellisense_before_the_editor() {
+        let mut editor = FilterEditor::new(r#"{"favorite": null}"#.into(), Vec::new());
+        editor.cursor_column = editor.lines[0].find("null").expect("null");
+        assert!(matches!(
+            press_control(&mut editor, KeyCode::Char(' ')),
+            FilterEditorCommand::Continue
+        ));
+
+        assert!(matches!(
+            editor.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            FilterEditorCommand::Continue
+        ));
+        assert!(editor.completions.is_none());
+        assert!(matches!(
+            editor.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            FilterEditorCommand::Cancel
+        ));
+    }
+
+    #[test]
+    fn json_delimiters_do_not_make_enter_accept_an_unrequested_completion() {
+        let mut editor = FilterEditor::new(r#"{"favorite": true}"#.into(), Vec::new());
+        editor.cursor_column = editor.lines[0].chars().count() - 1;
+
+        press(&mut editor, KeyCode::Char(','));
+        assert!(editor.completions.is_none());
+        press(&mut editor, KeyCode::Enter);
+
+        assert_eq!(editor.value(), "{\"favorite\": true,\n}");
     }
 
     #[test]
@@ -3005,6 +3326,34 @@ mod tests {
         let bottom = buffer_text(&terminal);
         assert!(bottom.contains("\"favorite\": null"));
         assert!(bottom.contains("showing lines"));
+    }
+
+    #[test]
+    fn filter_editor_renders_intellisense_suggestions() {
+        let mut editor = FilterEditor::new(r#"{"orientations": []}"#.into(), Vec::new());
+        editor.cursor_column = editor.lines[0]
+            .chars()
+            .position(|character| character == '[')
+            .expect("array")
+            + 1;
+        assert!(matches!(
+            press_control(&mut editor, KeyCode::Char(' ')),
+            FilterEditorCommand::Continue
+        ));
+        let mut app = mock_app(Mode::FilterEditor(editor));
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| render_modal(frame, &mut app))
+            .expect("draw IntelliSense");
+        let screen = buffer_text(&terminal);
+
+        assert!(screen.contains("Filter IntelliSense"));
+        assert!(screen.contains("landscape"));
+        assert!(screen.contains("portrait"));
+        assert!(screen.contains("Ctrl+Space refresh"));
+        insta::assert_snapshot!("filter_editor_intellisense", screen);
     }
 
     #[test]

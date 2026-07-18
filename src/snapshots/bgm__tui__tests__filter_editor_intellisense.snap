@@ -1,0 +1,33 @@
+---
+source: src/tui.rs
+expression: screen
+---
+
+
+  ┌ Filter editor — examples, saved presets, and FilterSpecV1 JSON ──────────────────────────────┐
+  │Load an example or saved collection, then edit JSON • facets AND; arrays OR                   │
+  │┌ Filter presets ──────────┐┌ JSON document ─────────────────────────────────────────────────┐│
+  ││▸ E All wallpapers        ││1 │ {"orientations": []}                                        ││
+  ││  E Dark landscapes       ││          ┌ Filter IntelliSense ───────────────────────────────┐││
+  ││  E Large wallpapers      ││          │▸ landscape           Width is greater than height  │││
+  ││  E Ultrawide             ││          │  portrait            Height is greater than width  │││
+  ││  E Warm palette          ││          │  square              Width and height are approxima│││
+  ││  E Favourites            ││          └────────────────────────────────────────────────────┘││
+  ││                          ││                                                                ││
+  ││                          ││                                                                ││
+  ││                          ││                                                                ││
+  ││                          ││                                                                ││
+  ││                          ││                                                                ││
+  ││                          ││                                                                ││
+  ││                          ││                                                                ││
+  ││                          ││                                                                ││
+  ││Example                   ││                                                                ││
+  ││No facets; show every     ││                                                                ││
+  ││ready image.              ││                                                                ││
+  ││                          ││                                                                ││
+  │└──────────────────────────┘└────────────────────────────────────────────────────────────────┘│
+  │IntelliSense: ↑/↓ choose • Tab/Enter accept • Ctrl+Space refresh • Esc closes                 │
+  │Ctrl+P save preset • Ctrl+S apply • Ctrl+R reset • Esc cancel                                 │
+  │E = built-in example • S = saved collection                                                   │
+  │Ln 1, Col 19 • showing lines 1–1 of 1                                                         │
+  └──────────────────────────────────────────────────────────────────────────────────────────────┘

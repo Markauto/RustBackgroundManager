@@ -26,7 +26,7 @@ expression: top
   ││ready image.              ││17 │   "ai_labels": [],                                         ││
   ││                          ││18 │   "semantic_text": null,                                   ││
   │└──────────────────────────┘└────────────────────────────────────────────────────────────────┘│
-  │JSON: arrows move • Enter inserts a line • Tab selects presets                                │
+  │JSON: arrows move • Enter new line • Ctrl+Space IntelliSense • Tab presets                    │
   │Ctrl+P save preset • Ctrl+S apply • Ctrl+R reset • Esc cancel                                 │
   │E = built-in example • S = saved collection                                                   │
   │Ln 1, Col 1 • showing lines 1–18 of 22                                                        │

@@ -7,6 +7,7 @@ pub mod config;
 pub mod db;
 pub mod doctor;
 pub mod filter;
+mod filter_completion;
 pub mod model;
 pub mod move_files;
 pub mod paths;
