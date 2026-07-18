@@ -56,7 +56,7 @@ bgm collection list
 bgm collection show night --json
 ```
 
-Filters cover source IDs, path fragments, dimensions, orientation, aspect ratios, luminance/light-dark class, dominant and palette Oklab distance, AI label estimates, arbitrary semantic text, tags, and favorites. The TUI’s `/` editor exposes the complete filter as editable `FilterSpecV1` JSON.
+Filters cover source IDs, path fragments, dimensions, orientation, aspect ratios, luminance/light-dark class, dominant and palette Oklab distance, AI label estimates, arbitrary semantic text, tags, and favorites. The TUI’s `/` editor exposes the complete filter as editable `FilterSpecV1` JSON alongside built-in examples and saved presets. TUI presets use the existing saved-collection store, so presets created there are also available to `bgm collection`, wpaperd bindings, and later TUI sessions.
 
 CLIP outputs are displayed as ranked estimates rather than authoritative tags. Seeded `mood`, `subject`, and `style` label packs can be edited, and custom packs can supply multiple prompts per label:
 
@@ -108,7 +108,7 @@ Scans, moves, label/tag/favorite changes, and collection updates refresh active 
 ## TUI keys
 
 - `↑`/`↓`, `j`/`k`, Page Up/Down, Home/End: navigate results
-- `/`: open the full-screen `FilterSpecV1` JSON editor
+- `/`: open the filter editor with built-in examples, saved presets, and full `FilterSpecV1` JSON
 - `f`: toggle favorite
 - `t`: add a tag
 - `c`: save, load, list, or delete collections
@@ -118,7 +118,7 @@ Scans, moves, label/tag/favorite changes, and collection updates refresh active 
 - `o` or Enter: open the original with `xdg-open`
 - `?`: help; `q`: quit
 
-Inside the filter editor, use the arrow keys, Home/End, and Page Up/Down to move through the pretty-printed JSON. Enter inserts a line, Backspace/Delete edit text, Ctrl+S validates and applies the filter, Ctrl+R restores the default filter, and Esc cancels. Parse or validation errors stay open in the editor so they can be corrected. Pasted multiline JSON is supported.
+Inside the filter editor, Tab switches between the preset list and pretty-printed JSON. In the preset list, use the arrow keys and Enter to load one of the read-only examples or a saved collection into the editor. Ctrl+P saves the current validated JSON as a named preset; saving an existing name updates it. In the JSON pane, the arrow keys, Home/End, and Page Up/Down move through the document, Enter inserts a line, and Backspace/Delete edit text. Ctrl+S validates and applies the filter, Ctrl+R restores the default filter, and Esc cancels. Parse or validation errors stay open in the editor so they can be corrected. Pasted multiline JSON and preset names are supported.
 
 Kitty graphics are selected when available. Other terminals use ratatui-image half-block rendering, and `xdg-open` remains available as a fallback.
 

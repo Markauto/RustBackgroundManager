@@ -29,13 +29,14 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::{
     AppPaths,
+    analysis::{LightDark, Orientation},
     collection::{
-        add_tag, delete_collection, get_collection, list_collections, save_collection,
-        search_resolved, set_favorite,
+        SavedCollection, add_tag, delete_collection, get_collection, list_collections,
+        save_collection, search_resolved, set_favorite,
     },
     config::Config,
     db::{Database, ImageRecord},
-    filter::FilterSpecV1,
+    filter::{ColourFilter, FilterSpecV1},
     model,
     move_files::{MovePlan, apply_move, plan_move},
     scan::{ScanEvent, ScanOptions, ScanReport, scan_catalog_with_progress},
@@ -62,7 +63,116 @@ enum FilterEditorCommand {
     Continue,
     Apply,
     Reset,
+    LoadPreset {
+        name: String,
+        filter: Box<FilterSpecV1>,
+    },
+    SavePreset(String),
     Cancel,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FilterEditorFocus {
+    Document,
+    Presets,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FilterPresetSource {
+    Example,
+    Saved,
+}
+
+impl FilterPresetSource {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Example => "Example",
+            Self::Saved => "Saved collection",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FilterPreset {
+    name: String,
+    description: String,
+    source: FilterPresetSource,
+    filter: FilterSpecV1,
+}
+
+impl FilterPreset {
+    fn example(name: &str, description: &str, filter: FilterSpecV1) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            source: FilterPresetSource::Example,
+            filter,
+        }
+    }
+}
+
+fn filter_presets(saved: Vec<SavedCollection>) -> Vec<FilterPreset> {
+    let mut presets = vec![
+        FilterPreset::example(
+            "All wallpapers",
+            "No facets; show every ready image.",
+            FilterSpecV1::default(),
+        ),
+        FilterPreset::example(
+            "Dark landscapes",
+            "Landscape orientation AND dark analysis.",
+            FilterSpecV1 {
+                orientations: vec![Orientation::Landscape],
+                light_dark: vec![LightDark::Dark],
+                ..FilterSpecV1::default()
+            },
+        ),
+        FilterPreset::example(
+            "Large wallpapers",
+            "At least 2560 × 1440 pixels.",
+            FilterSpecV1 {
+                min_width: Some(2560),
+                min_height: Some(1440),
+                ..FilterSpecV1::default()
+            },
+        ),
+        FilterPreset::example(
+            "Ultrawide",
+            "Landscape images near 21:9 (5% tolerance).",
+            FilterSpecV1 {
+                orientations: vec![Orientation::Landscape],
+                aspect_ratios: vec![21.0 / 9.0],
+                aspect_tolerance: 0.05,
+                ..FilterSpecV1::default()
+            },
+        ),
+        FilterPreset::example(
+            "Warm palette",
+            "Any palette colour near warm orange in Oklab.",
+            FilterSpecV1 {
+                palette_colours: vec![ColourFilter {
+                    hex: "#D08040".into(),
+                    max_distance: 0.10,
+                }],
+                ..FilterSpecV1::default()
+            },
+        ),
+        FilterPreset::example(
+            "Favourites",
+            "Only images marked as a favourite.",
+            FilterSpecV1 {
+                favorite: Some(true),
+                ..FilterSpecV1::default()
+            },
+        ),
+    ];
+    presets.extend(saved.into_iter().map(|collection| FilterPreset {
+        name: collection.name,
+        description: "A filter saved here or with `bgm collection save`.".into(),
+        source: FilterPresetSource::Saved,
+        filter: collection.filter,
+    }));
+    presets
 }
 
 struct FilterEditor {
@@ -73,11 +183,16 @@ struct FilterEditor {
     scroll_line: usize,
     scroll_column: usize,
     viewport_height: usize,
+    presets: Vec<FilterPreset>,
+    selected_preset: usize,
+    focus: FilterEditorFocus,
+    save_name: Option<String>,
     error: Option<String>,
+    notice: Option<String>,
 }
 
 impl FilterEditor {
-    fn new(value: String) -> Self {
+    fn new(value: String, saved: Vec<SavedCollection>) -> Self {
         let lines = value.split('\n').map(str::to_owned).collect();
         Self {
             lines,
@@ -87,7 +202,12 @@ impl FilterEditor {
             scroll_line: 0,
             scroll_column: 0,
             viewport_height: 10,
+            presets: filter_presets(saved),
+            selected_preset: 0,
+            focus: FilterEditorFocus::Document,
+            save_name: None,
             error: None,
+            notice: None,
         }
     }
 
@@ -95,17 +215,39 @@ impl FilterEditor {
         self.lines.join("\n")
     }
 
-    fn replace(&mut self, value: String) {
-        *self = Self::new(value);
+    fn replace_document(&mut self, value: String) {
+        self.lines = value.split('\n').map(str::to_owned).collect();
+        self.cursor_line = 0;
+        self.cursor_column = 0;
+        self.preferred_column = None;
+        self.scroll_line = 0;
+        self.scroll_column = 0;
+        self.error = None;
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> FilterEditorCommand {
+        if self.save_name.is_some() {
+            return self.handle_save_name_key(key);
+        }
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Esc => FilterEditorCommand::Cancel,
             KeyCode::Char('s' | 'S') if control => FilterEditorCommand::Apply,
             KeyCode::Enter if control => FilterEditorCommand::Apply,
             KeyCode::Char('r' | 'R') if control => FilterEditorCommand::Reset,
+            KeyCode::Char('p' | 'P') if control => {
+                self.begin_save_preset();
+                FilterEditorCommand::Continue
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.focus = match self.focus {
+                    FilterEditorFocus::Document => FilterEditorFocus::Presets,
+                    FilterEditorFocus::Presets => FilterEditorFocus::Document,
+                };
+                self.error = None;
+                FilterEditorCommand::Continue
+            }
+            _ if self.focus == FilterEditorFocus::Presets => self.handle_preset_key(key),
             KeyCode::Home if control => {
                 self.cursor_line = 0;
                 self.cursor_column = 0;
@@ -164,16 +306,131 @@ impl FilterEditor {
                 self.insert_newline();
                 FilterEditorCommand::Continue
             }
-            KeyCode::Tab | KeyCode::BackTab => {
-                self.insert_text("  ");
-                FilterEditorCommand::Continue
-            }
             KeyCode::Char(character) if !control => {
                 self.insert_char(character);
                 FilterEditorCommand::Continue
             }
             _ => FilterEditorCommand::Continue,
         }
+    }
+
+    fn handle_preset_key(&mut self, key: KeyEvent) -> FilterEditorCommand {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.selected_preset = self.selected_preset.saturating_sub(1);
+                FilterEditorCommand::Continue
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.selected_preset =
+                    (self.selected_preset + 1).min(self.presets.len().saturating_sub(1));
+                FilterEditorCommand::Continue
+            }
+            KeyCode::PageUp => {
+                self.selected_preset = self.selected_preset.saturating_sub(5);
+                FilterEditorCommand::Continue
+            }
+            KeyCode::PageDown => {
+                self.selected_preset =
+                    (self.selected_preset + 5).min(self.presets.len().saturating_sub(1));
+                FilterEditorCommand::Continue
+            }
+            KeyCode::Home => {
+                self.selected_preset = 0;
+                FilterEditorCommand::Continue
+            }
+            KeyCode::End => {
+                self.selected_preset = self.presets.len().saturating_sub(1);
+                FilterEditorCommand::Continue
+            }
+            KeyCode::Enter => self.presets.get(self.selected_preset).map_or(
+                FilterEditorCommand::Continue,
+                |preset| FilterEditorCommand::LoadPreset {
+                    name: preset.name.clone(),
+                    filter: Box::new(preset.filter.clone()),
+                },
+            ),
+            KeyCode::Char('s' | 'S') => {
+                self.begin_save_preset();
+                FilterEditorCommand::Continue
+            }
+            KeyCode::Right | KeyCode::Char('e') => {
+                self.focus = FilterEditorFocus::Document;
+                FilterEditorCommand::Continue
+            }
+            _ => FilterEditorCommand::Continue,
+        }
+    }
+
+    fn begin_save_preset(&mut self) {
+        let existing_name = self
+            .presets
+            .get(self.selected_preset)
+            .filter(|preset| {
+                self.focus == FilterEditorFocus::Presets
+                    && preset.source == FilterPresetSource::Saved
+            })
+            .map_or_else(String::new, |preset| preset.name.clone());
+        self.save_name = Some(existing_name);
+        self.error = None;
+        self.notice = None;
+    }
+
+    fn handle_save_name_key(&mut self, key: KeyEvent) -> FilterEditorCommand {
+        match key.code {
+            KeyCode::Esc => {
+                self.save_name = None;
+                self.error = None;
+                FilterEditorCommand::Continue
+            }
+            KeyCode::Enter => {
+                let name = self.save_name.take().unwrap_or_default();
+                if name.trim().is_empty() {
+                    self.error = Some("preset name cannot be empty".into());
+                    self.save_name = Some(name);
+                    FilterEditorCommand::Continue
+                } else {
+                    FilterEditorCommand::SavePreset(name)
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(name) = &mut self.save_name {
+                    name.pop();
+                }
+                self.error = None;
+                FilterEditorCommand::Continue
+            }
+            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if !character.is_control()
+                    && let Some(name) = &mut self.save_name
+                {
+                    name.push(character);
+                }
+                self.error = None;
+                FilterEditorCommand::Continue
+            }
+            _ => FilterEditorCommand::Continue,
+        }
+    }
+
+    fn paste(&mut self, value: &str) {
+        if let Some(name) = &mut self.save_name {
+            name.extend(value.chars().filter(|character| !character.is_control()));
+            self.error = None;
+        } else if self.focus == FilterEditorFocus::Document {
+            self.insert_text(value);
+        }
+    }
+
+    fn refresh_saved_presets(&mut self, saved: Vec<SavedCollection>, selected_name: &str) {
+        self.presets = filter_presets(saved);
+        self.selected_preset = self
+            .presets
+            .iter()
+            .position(|preset| {
+                preset.source == FilterPresetSource::Saved
+                    && preset.name.eq_ignore_ascii_case(selected_name)
+            })
+            .unwrap_or(0);
     }
 
     fn insert_text(&mut self, value: &str) {
@@ -275,6 +532,7 @@ impl FilterEditor {
     fn changed(&mut self) {
         self.preferred_column = None;
         self.error = None;
+        self.notice = None;
     }
 
     fn ensure_cursor_visible(&mut self, width: usize, height: usize) {
@@ -721,7 +979,47 @@ fn handle_filter_editor_key(
         FilterEditorCommand::Reset => {
             let value = serde_json::to_string_pretty(&FilterSpecV1::default())?;
             if let Mode::FilterEditor(editor) = &mut app.mode {
-                editor.replace(value);
+                editor.replace_document(value);
+                editor.focus = FilterEditorFocus::Document;
+                editor.notice = Some("Reset to all wallpapers; Ctrl+S applies it.".into());
+            }
+        }
+        FilterEditorCommand::LoadPreset { name, filter } => {
+            let value = serde_json::to_string_pretty(&filter)?;
+            if let Mode::FilterEditor(editor) = &mut app.mode {
+                editor.replace_document(value);
+                editor.focus = FilterEditorFocus::Document;
+                editor.notice = Some(format!("Loaded {name}; Ctrl+S applies it."));
+            }
+        }
+        FilterEditorCommand::SavePreset(name) => {
+            let value = match &app.mode {
+                Mode::FilterEditor(editor) => editor.value(),
+                _ => return Ok(()),
+            };
+            let result = (|| -> Result<(SavedCollection, Vec<SavedCollection>)> {
+                let filter = parse_filter(&value)?;
+                let saved = save_collection(database, &name, &filter)?;
+                let presets = list_collections(database)?;
+                Ok((saved, presets))
+            })();
+            match result {
+                Ok((saved, presets)) => {
+                    let _ = wpaperd::refresh(database, paths, None);
+                    if let Mode::FilterEditor(editor) = &mut app.mode {
+                        editor.refresh_saved_presets(presets, &saved.name);
+                        editor.focus = FilterEditorFocus::Presets;
+                        editor.notice = Some(format!("Saved preset {}.", saved.name));
+                        editor.error = None;
+                    }
+                    app.status = format!("Saved filter preset {}", saved.name);
+                }
+                Err(error) => {
+                    if let Mode::FilterEditor(editor) = &mut app.mode {
+                        editor.focus = FilterEditorFocus::Document;
+                        editor.error = Some(format!("{error:#}"));
+                    }
+                }
             }
         }
         FilterEditorCommand::Apply => {
@@ -744,7 +1042,7 @@ fn handle_filter_editor_key(
 
 fn handle_paste(app: &mut App, value: &str) {
     match &mut app.mode {
-        Mode::FilterEditor(editor) => editor.insert_text(value),
+        Mode::FilterEditor(editor) => editor.paste(value),
         Mode::Input {
             value: input_value, ..
         } => input_value.extend(
@@ -779,9 +1077,10 @@ fn handle_browse_key(
         }
         KeyCode::Char('?') => app.mode = Mode::Help,
         KeyCode::Char('/') => {
-            app.mode = Mode::FilterEditor(FilterEditor::new(serde_json::to_string_pretty(
-                &app.filter,
-            )?));
+            app.mode = Mode::FilterEditor(FilterEditor::new(
+                serde_json::to_string_pretty(&app.filter)?,
+                list_collections(database)?,
+            ));
         }
         KeyCode::Char('t') => {
             app.mode = Mode::Input {
@@ -914,13 +1213,7 @@ fn submit_input(
 }
 
 fn apply_filter(app: &mut App, value: &str, database: &Database, paths: &AppPaths) -> Result<()> {
-    let filter = if value.trim().is_empty() {
-        FilterSpecV1::default()
-    } else {
-        serde_json::from_str::<FilterSpecV1>(value)
-            .context("filter must be valid FilterSpecV1 JSON")?
-    };
-    filter.validate()?;
+    let filter = parse_filter(value)?;
 
     let previous_filter = std::mem::replace(&mut app.filter, filter);
     if let Err(error) = app.reload(database, paths) {
@@ -929,6 +1222,17 @@ fn apply_filter(app: &mut App, value: &str, database: &Database, paths: &AppPath
     }
     app.status = format!("Filter applied — {} result(s)", app.images.len());
     Ok(())
+}
+
+fn parse_filter(value: &str) -> Result<FilterSpecV1> {
+    let filter = if value.trim().is_empty() {
+        FilterSpecV1::default()
+    } else {
+        serde_json::from_str::<FilterSpecV1>(value)
+            .context("filter must be valid FilterSpecV1 JSON")?
+    };
+    filter.validate()?;
+    Ok(filter)
 }
 
 fn draw(frame: &mut Frame<'_>, app: &mut App) {
@@ -1150,7 +1454,7 @@ fn render_modal(frame: &mut Frame<'_>, app: &mut App) {
             frame.render_widget(Clear, area);
             frame.render_widget(
                 Paragraph::new(
-                    "Keyboard\n\n↑/↓, j/k  navigate\n/          edit full FilterSpecV1 JSON\nf          toggle favorite\nt          add a custom tag\nc          save/load/list/delete collections\nm          preview move of selected image\nw          bind or unbind a wpaperd display\ns          background scan and GPU analysis\no, Enter   open with xdg-open\nq          quit\n\nFilter editor\nArrow keys  move cursor\nHome/End    start/end of line\nPgUp/PgDn  scroll through document\nEnter       insert line\nCtrl+S      apply filter\nCtrl+R      reset every facet\nEsc         cancel\n\nPress any key to close.",
+                    "Keyboard\n\n↑/↓, j/k  navigate\n/          filter examples, presets, and JSON\nf          toggle favorite\nt          add a custom tag\nc          save/load/list/delete collections\nm          preview move of selected image\nw          bind or unbind a wpaperd display\ns          background scan and GPU analysis\no, Enter   open with xdg-open\nq          quit\n\nFilter editor\nTab         switch JSON/preset panes\n↑/↓ + Enter select and load a preset\nCtrl+P      save JSON as a named preset\nCtrl+S      apply filter\nCtrl+R      reset every facet\nEsc         cancel\n\nSaved presets are collections and work with the CLI and wpaperd.\n\nPress any key to close.",
                 )
                 .wrap(Wrap { trim: false })
                 .block(Block::default().borders(Borders::ALL).title(" Help ")),
@@ -1222,12 +1526,12 @@ fn render_modal(frame: &mut Frame<'_>, app: &mut App) {
 }
 
 fn render_filter_editor(frame: &mut Frame<'_>, editor: &mut FilterEditor) {
-    let area = centered_rect(92, 88, frame.area());
+    let area = centered_rect(96, 90, frame.area());
     frame.render_widget(Clear, area);
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" Filter editor — FilterSpecV1 JSON ");
+        .title(" Filter editor — examples, saved presets, and FilterSpecV1 JSON ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let sections = Layout::default()
@@ -1235,17 +1539,92 @@ fn render_filter_editor(frame: &mut Frame<'_>, editor: &mut FilterEditor) {
         .constraints([
             Constraint::Length(1),
             Constraint::Min(1),
-            Constraint::Length(3),
+            Constraint::Length(4),
         ])
         .split(inner);
 
     frame.render_widget(
-        Paragraph::new("Edit JSON directly • facets use AND; array values use OR")
-            .style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(
+            "Load an example or saved collection, then edit JSON • facets AND; arrays OR",
+        )
+        .style(Style::default().fg(Color::DarkGray)),
         sections[0],
     );
 
-    let editor_area = sections[1];
+    let main = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(30), Constraint::Min(30)])
+        .split(sections[1]);
+
+    let preset_border = if editor.focus == FilterEditorFocus::Presets {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
+    let preset_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(preset_border))
+        .title(" Filter presets ");
+    let preset_inner = preset_block.inner(main[0]);
+    frame.render_widget(preset_block, main[0]);
+    let preset_sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(4)])
+        .split(preset_inner);
+    let preset_items = editor
+        .presets
+        .iter()
+        .map(|preset| {
+            let (marker, colour) = match preset.source {
+                FilterPresetSource::Example => ("E", Color::Cyan),
+                FilterPresetSource::Saved => ("S", Color::Magenta),
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{marker} "), Style::default().fg(colour)),
+                Span::raw(preset.name.clone()),
+            ]))
+        })
+        .collect::<Vec<_>>();
+    let mut preset_state = ListState::default().with_selected(Some(editor.selected_preset));
+    frame.render_stateful_widget(
+        List::new(preset_items)
+            .highlight_symbol("▸ ")
+            .highlight_style(
+                Style::default()
+                    .bg(Color::Rgb(35, 48, 65))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        preset_sections[0],
+        &mut preset_state,
+    );
+    let preset_description = editor.presets.get(editor.selected_preset).map_or_else(
+        || Text::from("No presets"),
+        |preset| {
+            Text::from(vec![
+                Line::from(Span::styled(
+                    preset.source.label(),
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(preset.description.clone()),
+            ])
+        },
+    );
+    frame.render_widget(
+        Paragraph::new(preset_description).wrap(Wrap { trim: false }),
+        preset_sections[1],
+    );
+
+    let document_border = if editor.focus == FilterEditorFocus::Document {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
+    let document_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(document_border))
+        .title(" JSON document ");
+    let editor_area = document_block.inner(main[1]);
+    frame.render_widget(document_block, main[1]);
     let line_number_width = editor.lines.len().to_string().len();
     let gutter_width = u16::try_from(line_number_width + 3)
         .unwrap_or(u16::MAX)
@@ -1283,20 +1662,36 @@ fn render_filter_editor(frame: &mut Frame<'_>, editor: &mut FilterEditor) {
         visible_end,
         editor.lines.len()
     );
-    let feedback = editor.error.as_ref().map_or_else(
-        || Span::styled(location, Style::default().fg(Color::DarkGray)),
-        |error| Span::styled(format!("Error: {error}"), Style::default().fg(Color::Red)),
-    );
+    let feedback = if let Some(error) = &editor.error {
+        Span::styled(format!("Error: {error}"), Style::default().fg(Color::Red))
+    } else if let Some(notice) = &editor.notice {
+        Span::styled(notice.clone(), Style::default().fg(Color::Green))
+    } else {
+        Span::styled(location, Style::default().fg(Color::DarkGray))
+    };
+    let focus_help = match editor.focus {
+        FilterEditorFocus::Document => {
+            "JSON: arrows move • Enter inserts a line • Tab selects presets"
+        }
+        FilterEditorFocus::Presets => {
+            "Presets: ↑/↓ choose • Enter loads • s saves • Tab edits JSON"
+        }
+    };
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from("Arrows/Home/End/PgUp/PgDn move • Enter inserts a line"),
-            Line::from("Ctrl+S apply • Ctrl+R reset • Esc cancel"),
+            Line::from(focus_help),
+            Line::from("Ctrl+P save preset • Ctrl+S apply • Ctrl+R reset • Esc cancel"),
+            Line::from("E = built-in example • S = saved collection"),
             Line::from(feedback),
         ]),
         sections[2],
     );
 
-    if content_width > 0 && editor_area.height > 0 {
+    if editor.focus == FilterEditorFocus::Document
+        && editor.save_name.is_none()
+        && content_width > 0
+        && editor_area.height > 0
+    {
         let cursor_x = display_width(
             &editor.lines[editor.cursor_line],
             editor.scroll_column,
@@ -1311,6 +1706,36 @@ fn render_filter_editor(frame: &mut Frame<'_>, editor: &mut FilterEditor) {
         frame.set_cursor_position((
             editor_area.x + gutter_width + cursor_x,
             editor_area.y + cursor_y,
+        ));
+    }
+
+    if let Some(name) = &editor.save_name {
+        let prompt_area = centered_rect(64, 24, area);
+        frame.render_widget(Clear, prompt_area);
+        let prompt_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(" Save filter preset ");
+        let prompt_inner = prompt_block.inner(prompt_area);
+        frame.render_widget(prompt_block, prompt_area);
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from("Saved presets are also available as collections."),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("> ", Style::default().fg(Color::Cyan)),
+                    Span::raw(name.clone()),
+                    Span::styled("█", Style::default().fg(Color::Cyan)),
+                ]),
+                Line::from("Enter saves or updates • Esc cancels"),
+            ]),
+            prompt_inner,
+        );
+        let cursor_offset =
+            u16::try_from(display_width(name, 0, name.chars().count())).unwrap_or(u16::MAX);
+        frame.set_cursor_position((
+            prompt_inner.x + 2 + cursor_offset.min(prompt_inner.width.saturating_sub(3)),
+            prompt_inner.y + 2,
         ));
     }
 }
@@ -1442,7 +1867,7 @@ mod tests {
 
     #[test]
     fn filter_editor_navigates_and_edits_across_lines() {
-        let mut editor = FilterEditor::new("abcdef\nx\nabcdef".into());
+        let mut editor = FilterEditor::new("abcdef\nx\nabcdef".into(), Vec::new());
 
         press(&mut editor, KeyCode::End);
         press(&mut editor, KeyCode::Down);
@@ -1464,7 +1889,7 @@ mod tests {
 
     #[test]
     fn filter_editor_accepts_multiline_paste() {
-        let mut editor = FilterEditor::new(String::new());
+        let mut editor = FilterEditor::new(String::new(), Vec::new());
         editor.insert_text("{\r\n\t\"tags\": [\"café\"]\r\n}");
 
         assert_eq!(editor.value(), "{\n  \"tags\": [\"café\"]\n}");
@@ -1477,7 +1902,7 @@ mod tests {
             .map(|index| format!("line {index:02}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let mut editor = FilterEditor::new(value);
+        let mut editor = FilterEditor::new(value, Vec::new());
         assert!(matches!(
             press_control(&mut editor, KeyCode::End),
             FilterEditorCommand::Continue
@@ -1500,7 +1925,7 @@ mod tests {
 
     #[test]
     fn filter_editor_commands_do_not_modify_the_document() {
-        let mut editor = FilterEditor::new("{}".into());
+        let mut editor = FilterEditor::new("{}".into(), Vec::new());
 
         assert!(matches!(
             press_control(&mut editor, KeyCode::Char('s')),
@@ -1520,7 +1945,7 @@ mod tests {
     #[test]
     fn invalid_filter_stays_open_for_correction() {
         let (_directory, paths, database, mut app) = empty_runtime();
-        app.mode = Mode::FilterEditor(FilterEditor::new("{".into()));
+        app.mode = Mode::FilterEditor(FilterEditor::new("{".into(), Vec::new()));
 
         handle_filter_editor_key(
             &mut app,
@@ -1546,6 +1971,7 @@ mod tests {
         let (_directory, paths, database, mut app) = empty_runtime();
         app.mode = Mode::FilterEditor(FilterEditor::new(
             r#"{"min_width":2560,"orientations":["landscape"]}"#.into(),
+            Vec::new(),
         ));
 
         handle_filter_editor_key(
@@ -1563,9 +1989,102 @@ mod tests {
     }
 
     #[test]
+    fn built_in_filter_presets_are_valid_examples() {
+        let presets = filter_presets(Vec::new());
+
+        assert_eq!(presets.len(), 6);
+        assert!(
+            presets
+                .iter()
+                .all(|preset| preset.source == FilterPresetSource::Example)
+        );
+        for preset in presets {
+            preset.filter.validate().expect("valid example preset");
+        }
+    }
+
+    #[test]
+    fn filter_editor_loads_a_selected_example_into_the_document() {
+        let (_directory, paths, database, mut app) = empty_runtime();
+        app.mode = Mode::FilterEditor(FilterEditor::new("{}".into(), Vec::new()));
+
+        for key in [KeyCode::Tab, KeyCode::Down, KeyCode::Enter] {
+            handle_filter_editor_key(
+                &mut app,
+                KeyEvent::new(key, KeyModifiers::NONE),
+                &database,
+                &paths,
+            )
+            .expect("handle preset key");
+        }
+
+        let Mode::FilterEditor(editor) = &app.mode else {
+            panic!("loading a preset closed the editor");
+        };
+        let loaded = parse_filter(&editor.value()).expect("loaded preset JSON");
+        assert_eq!(loaded.orientations, vec![Orientation::Landscape]);
+        assert_eq!(loaded.light_dark, vec![LightDark::Dark]);
+        assert_eq!(editor.focus, FilterEditorFocus::Document);
+        assert_eq!(
+            editor.notice.as_deref(),
+            Some("Loaded Dark landscapes; Ctrl+S applies it.")
+        );
+    }
+
+    #[test]
+    fn filter_editor_saves_the_document_as_a_selectable_preset() {
+        let (_directory, paths, database, mut app) = empty_runtime();
+        let filter = FilterSpecV1 {
+            favorite: Some(true),
+            ..FilterSpecV1::default()
+        };
+        app.mode = Mode::FilterEditor(FilterEditor::new(
+            serde_json::to_string_pretty(&filter).expect("serialize"),
+            Vec::new(),
+        ));
+
+        handle_filter_editor_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            &database,
+            &paths,
+        )
+        .expect("open save prompt");
+        for character in "My favourites".chars() {
+            handle_filter_editor_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                &database,
+                &paths,
+            )
+            .expect("type preset name");
+        }
+        handle_filter_editor_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &database,
+            &paths,
+        )
+        .expect("save preset");
+
+        let saved = get_collection(&database, "my favourites")
+            .expect("read preset")
+            .expect("saved preset");
+        assert_eq!(saved.filter.favorite, Some(true));
+        let Mode::FilterEditor(editor) = &app.mode else {
+            panic!("saving a preset closed the editor");
+        };
+        assert_eq!(editor.focus, FilterEditorFocus::Presets);
+        assert!(editor.presets.iter().any(|preset| {
+            preset.source == FilterPresetSource::Saved && preset.name == "My favourites"
+        }));
+        assert_eq!(app.status, "Saved filter preset My favourites");
+    }
+
+    #[test]
     fn filter_editor_renders_the_full_document_with_scrolling() {
         let value = serde_json::to_string_pretty(&FilterSpecV1::default()).expect("serialize");
-        let mut app = mock_app(Mode::FilterEditor(FilterEditor::new(value)));
+        let mut app = mock_app(Mode::FilterEditor(FilterEditor::new(value, Vec::new())));
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).expect("terminal");
 
@@ -1574,7 +2093,11 @@ mod tests {
             .expect("draw top");
         let top = buffer_text(&terminal);
         assert!(top.contains("\"version\": 1"));
+        assert!(top.contains("All wallpapers"));
+        assert!(top.contains("Dark landscapes"));
+        assert!(top.contains("Ctrl+P save preset"));
         assert!(top.contains("Ctrl+S apply"));
+        insta::assert_snapshot!("filter_editor", top);
 
         if let Mode::FilterEditor(editor) = &mut app.mode {
             assert!(matches!(

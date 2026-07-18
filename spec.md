@@ -54,8 +54,9 @@
     or luminance range, dominant/palette colour and distance, AI pack labels and score thresholds, semantic text, custom tags, and favorites. Different facets combine with
     AND; repeated values within one facet combine with OR.
 
-  - Build a Ratatui browser with a result list, Kitty image preview, palette/metadata pane, filter editor, collection management, tag/favorite actions, move preview, and
-    wpaperd binding dialog. Provide half-block rendering and xdg-open fallback when Kitty graphics are unavailable.
+  - Build a Ratatui browser with a result list, Kitty image preview, palette/metadata pane, filter editor, built-in example filters, collection-backed preset selection and
+    saving, collection management, tag/favorite actions, move preview, and wpaperd binding dialog. Provide half-block rendering and xdg-open fallback when Kitty graphics
+    are unavailable.
 
   - Keep scans and GPU analysis off the UI thread, expose progress and per-file failures, and serialize database writes safely.
 

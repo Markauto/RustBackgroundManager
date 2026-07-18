@@ -1,0 +1,33 @@
+---
+source: src/tui.rs
+expression: top
+---
+
+
+  ┌ Filter editor — examples, saved presets, and FilterSpecV1 JSON ──────────────────────────────┐
+  │Load an example or saved collection, then edit JSON • facets AND; arrays OR                   │
+  │┌ Filter presets ──────────┐┌ JSON document ─────────────────────────────────────────────────┐│
+  ││▸ E All wallpapers        ││ 1 │ {                                                          ││
+  ││  E Dark landscapes       ││ 2 │   "version": 1,                                            ││
+  ││  E Large wallpapers      ││ 3 │   "source_ids": [],                                        ││
+  ││  E Ultrawide             ││ 4 │   "paths": [],                                             ││
+  ││  E Warm palette          ││ 5 │   "min_width": null,                                       ││
+  ││  E Favourites            ││ 6 │   "max_width": null,                                       ││
+  ││                          ││ 7 │   "min_height": null,                                      ││
+  ││                          ││ 8 │   "max_height": null,                                      ││
+  ││                          ││ 9 │   "orientations": [],                                      ││
+  ││                          ││10 │   "aspect_ratios": [],                                     ││
+  ││                          ││11 │   "aspect_tolerance": 0.03,                                ││
+  ││                          ││12 │   "light_dark": [],                                        ││
+  ││                          ││13 │   "min_luminance": null,                                   ││
+  ││                          ││14 │   "max_luminance": null,                                   ││
+  ││Example                   ││15 │   "dominant_colours": [],                                  ││
+  ││No facets; show every     ││16 │   "palette_colours": [],                                   ││
+  ││ready image.              ││17 │   "ai_labels": [],                                         ││
+  ││                          ││18 │   "semantic_text": null,                                   ││
+  │└──────────────────────────┘└────────────────────────────────────────────────────────────────┘│
+  │JSON: arrows move • Enter inserts a line • Tab selects presets                                │
+  │Ctrl+P save preset • Ctrl+S apply • Ctrl+R reset • Esc cancel                                 │
+  │E = built-in example • S = saved collection                                                   │
+  │Ln 1, Col 1 • showing lines 1–18 of 22                                                        │
+  └──────────────────────────────────────────────────────────────────────────────────────────────┘
