@@ -40,6 +40,7 @@ tempfile = "3.23.0"
 toml = "0.9.8"
 toml_edit = { version = "0.25.8", features = ["serde"] }
 tokenizers = { version = "0.23.1", default-features = false, features = ["onig"], optional = true }
+unicode-width = "0.2.2"
 ureq = { version = "2.12.1", default-features = false, features = ["tls"] }
 uuid = { version = "1.18.1", features = ["v4", "serde"] }
 walkdir = "2.5.0"

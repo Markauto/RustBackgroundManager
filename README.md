@@ -108,7 +108,7 @@ Scans, moves, label/tag/favorite changes, and collection updates refresh active 
 ## TUI keys
 
 - `↑`/`↓`, `j`/`k`, Page Up/Down, Home/End: navigate results
-- `/`: edit full `FilterSpecV1` JSON
+- `/`: open the full-screen `FilterSpecV1` JSON editor
 - `f`: toggle favorite
 - `t`: add a tag
 - `c`: save, load, list, or delete collections
@@ -117,6 +117,8 @@ Scans, moves, label/tag/favorite changes, and collection updates refresh active 
 - `s`: run scan and optional GPU analysis off the UI thread
 - `o` or Enter: open the original with `xdg-open`
 - `?`: help; `q`: quit
+
+Inside the filter editor, use the arrow keys, Home/End, and Page Up/Down to move through the pretty-printed JSON. Enter inserts a line, Backspace/Delete edit text, Ctrl+S validates and applies the filter, Ctrl+R restores the default filter, and Esc cancels. Parse or validation errors stay open in the editor so they can be corrected. Pasted multiline JSON is supported.
 
 Kitty graphics are selected when available. Other terminals use ratatui-image half-block rendering, and `xdg-open` remains available as a fallback.
 

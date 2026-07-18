@@ -10,7 +10,8 @@ use crossbeam_channel::{Receiver, TryRecvError, unbounded};
 use crossterm::{
     cursor::Show,
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEvent, KeyModifiers,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -24,6 +25,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 use ratatui_image::{Resize, StatefulImage, picker::Picker, protocol::StatefulProtocol};
+use unicode_width::UnicodeWidthChar;
 
 use crate::{
     AppPaths,
@@ -40,8 +42,8 @@ use crate::{
     wpaperd,
 };
 
+#[derive(Clone, Copy)]
 enum InputAction {
-    Filter,
     Tag,
     Collection,
     Move,
@@ -50,9 +52,281 @@ enum InputAction {
 
 enum Mode {
     Browse,
+    FilterEditor(FilterEditor),
     Input { action: InputAction, value: String },
     ConfirmMove(MovePlan),
     Help,
+}
+
+enum FilterEditorCommand {
+    Continue,
+    Apply,
+    Reset,
+    Cancel,
+}
+
+struct FilterEditor {
+    lines: Vec<String>,
+    cursor_line: usize,
+    cursor_column: usize,
+    preferred_column: Option<usize>,
+    scroll_line: usize,
+    scroll_column: usize,
+    viewport_height: usize,
+    error: Option<String>,
+}
+
+impl FilterEditor {
+    fn new(value: String) -> Self {
+        let lines = value.split('\n').map(str::to_owned).collect();
+        Self {
+            lines,
+            cursor_line: 0,
+            cursor_column: 0,
+            preferred_column: None,
+            scroll_line: 0,
+            scroll_column: 0,
+            viewport_height: 10,
+            error: None,
+        }
+    }
+
+    fn value(&self) -> String {
+        self.lines.join("\n")
+    }
+
+    fn replace(&mut self, value: String) {
+        *self = Self::new(value);
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> FilterEditorCommand {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => FilterEditorCommand::Cancel,
+            KeyCode::Char('s' | 'S') if control => FilterEditorCommand::Apply,
+            KeyCode::Enter if control => FilterEditorCommand::Apply,
+            KeyCode::Char('r' | 'R') if control => FilterEditorCommand::Reset,
+            KeyCode::Home if control => {
+                self.cursor_line = 0;
+                self.cursor_column = 0;
+                self.preferred_column = None;
+                FilterEditorCommand::Continue
+            }
+            KeyCode::End if control => {
+                self.cursor_line = self.lines.len() - 1;
+                self.cursor_column = self.current_line_len();
+                self.preferred_column = None;
+                FilterEditorCommand::Continue
+            }
+            KeyCode::Left => {
+                self.move_left();
+                FilterEditorCommand::Continue
+            }
+            KeyCode::Right => {
+                self.move_right();
+                FilterEditorCommand::Continue
+            }
+            KeyCode::Up => {
+                self.move_vertical(-1);
+                FilterEditorCommand::Continue
+            }
+            KeyCode::Down => {
+                self.move_vertical(1);
+                FilterEditorCommand::Continue
+            }
+            KeyCode::PageUp => {
+                self.move_vertical(-self.page_size());
+                FilterEditorCommand::Continue
+            }
+            KeyCode::PageDown => {
+                self.move_vertical(self.page_size());
+                FilterEditorCommand::Continue
+            }
+            KeyCode::Home => {
+                self.cursor_column = 0;
+                self.preferred_column = None;
+                FilterEditorCommand::Continue
+            }
+            KeyCode::End => {
+                self.cursor_column = self.current_line_len();
+                self.preferred_column = None;
+                FilterEditorCommand::Continue
+            }
+            KeyCode::Backspace => {
+                self.backspace();
+                FilterEditorCommand::Continue
+            }
+            KeyCode::Delete => {
+                self.delete();
+                FilterEditorCommand::Continue
+            }
+            KeyCode::Enter => {
+                self.insert_newline();
+                FilterEditorCommand::Continue
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.insert_text("  ");
+                FilterEditorCommand::Continue
+            }
+            KeyCode::Char(character) if !control => {
+                self.insert_char(character);
+                FilterEditorCommand::Continue
+            }
+            _ => FilterEditorCommand::Continue,
+        }
+    }
+
+    fn insert_text(&mut self, value: &str) {
+        for character in value.chars() {
+            match character {
+                '\r' => {}
+                '\n' => self.insert_newline(),
+                '\t' => {
+                    self.insert_char(' ');
+                    self.insert_char(' ');
+                }
+                character if !character.is_control() => self.insert_char(character),
+                _ => {}
+            }
+        }
+    }
+
+    fn insert_char(&mut self, character: char) {
+        let byte_index = char_to_byte_index(&self.lines[self.cursor_line], self.cursor_column);
+        self.lines[self.cursor_line].insert(byte_index, character);
+        self.cursor_column += 1;
+        self.changed();
+    }
+
+    fn insert_newline(&mut self) {
+        let byte_index = char_to_byte_index(&self.lines[self.cursor_line], self.cursor_column);
+        let remainder = self.lines[self.cursor_line].split_off(byte_index);
+        self.cursor_line += 1;
+        self.lines.insert(self.cursor_line, remainder);
+        self.cursor_column = 0;
+        self.changed();
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor_column > 0 {
+            self.cursor_column -= 1;
+            let byte_index = char_to_byte_index(&self.lines[self.cursor_line], self.cursor_column);
+            self.lines[self.cursor_line].remove(byte_index);
+            self.changed();
+        } else if self.cursor_line > 0 {
+            let current = self.lines.remove(self.cursor_line);
+            self.cursor_line -= 1;
+            self.cursor_column = self.current_line_len();
+            self.lines[self.cursor_line].push_str(&current);
+            self.changed();
+        }
+    }
+
+    fn delete(&mut self) {
+        if self.cursor_column < self.current_line_len() {
+            let byte_index = char_to_byte_index(&self.lines[self.cursor_line], self.cursor_column);
+            self.lines[self.cursor_line].remove(byte_index);
+            self.changed();
+        } else if self.cursor_line + 1 < self.lines.len() {
+            let next = self.lines.remove(self.cursor_line + 1);
+            self.lines[self.cursor_line].push_str(&next);
+            self.changed();
+        }
+    }
+
+    fn move_left(&mut self) {
+        if self.cursor_column > 0 {
+            self.cursor_column -= 1;
+        } else if self.cursor_line > 0 {
+            self.cursor_line -= 1;
+            self.cursor_column = self.current_line_len();
+        }
+        self.preferred_column = None;
+    }
+
+    fn move_right(&mut self) {
+        if self.cursor_column < self.current_line_len() {
+            self.cursor_column += 1;
+        } else if self.cursor_line + 1 < self.lines.len() {
+            self.cursor_line += 1;
+            self.cursor_column = 0;
+        }
+        self.preferred_column = None;
+    }
+
+    fn move_vertical(&mut self, amount: isize) {
+        let preferred = self.preferred_column.unwrap_or(self.cursor_column);
+        self.cursor_line = self
+            .cursor_line
+            .saturating_add_signed(amount)
+            .min(self.lines.len() - 1);
+        self.cursor_column = preferred.min(self.current_line_len());
+        self.preferred_column = Some(preferred);
+    }
+
+    fn page_size(&self) -> isize {
+        isize::try_from(self.viewport_height.saturating_sub(1).max(1)).unwrap_or(isize::MAX)
+    }
+
+    fn current_line_len(&self) -> usize {
+        self.lines[self.cursor_line].chars().count()
+    }
+
+    fn changed(&mut self) {
+        self.preferred_column = None;
+        self.error = None;
+    }
+
+    fn ensure_cursor_visible(&mut self, width: usize, height: usize) {
+        self.viewport_height = height.max(1);
+        if self.cursor_line < self.scroll_line {
+            self.scroll_line = self.cursor_line;
+        } else if self.cursor_line >= self.scroll_line + self.viewport_height {
+            self.scroll_line = self.cursor_line + 1 - self.viewport_height;
+        }
+
+        if self.cursor_column < self.scroll_column {
+            self.scroll_column = self.cursor_column;
+        }
+        let line = &self.lines[self.cursor_line];
+        while display_width(line, self.scroll_column, self.cursor_column) >= width.max(1)
+            && self.scroll_column < self.cursor_column
+        {
+            self.scroll_column += 1;
+        }
+    }
+}
+
+fn char_to_byte_index(value: &str, char_index: usize) -> usize {
+    value
+        .char_indices()
+        .nth(char_index)
+        .map_or(value.len(), |(index, _)| index)
+}
+
+fn display_width(value: &str, start: usize, end: usize) -> usize {
+    value
+        .chars()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .map(|character| character.width().unwrap_or_default())
+        .sum()
+}
+
+fn visible_text(value: &str, start: usize, max_width: usize) -> String {
+    let mut width = 0;
+    value
+        .chars()
+        .skip(start)
+        .take_while(|character| {
+            let next_width = width + character.width().unwrap_or_default();
+            if next_width > max_width {
+                return false;
+            }
+            width = next_width;
+            true
+        })
+        .collect()
 }
 
 enum BackgroundResult {
@@ -299,9 +573,20 @@ pub fn run(database: &Database, paths: &AppPaths, config: &Config) -> Result<()>
     let mut app = App::new(database, paths)?;
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
+    if let Err(error) = execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    ) {
         let _ = disable_raw_mode();
-        let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture, Show);
+        let _ = execute!(
+            stdout,
+            LeaveAlternateScreen,
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            Show
+        );
         return Err(error.into());
     }
     let cleanup = TerminalCleanup;
@@ -324,6 +609,7 @@ impl Drop for TerminalCleanup {
         let _ = execute!(
             std::io::stdout(),
             LeaveAlternateScreen,
+            DisableBracketedPaste,
             DisableMouseCapture,
             Show
         );
@@ -342,13 +628,21 @@ fn run_loop(
             app.status = format!("Background result error: {error:#}");
         }
         terminal.draw(|frame| draw(frame, app))?;
-        if event::poll(Duration::from_millis(100))?
-            && let Event::Key(key) = event::read()?
-            && key.kind == crossterm::event::KeyEventKind::Press
-            && let Err(error) = handle_key(app, key, database, paths, config)
-        {
-            app.mode = Mode::Browse;
-            app.status = format!("Error: {error:#}");
+        if event::poll(Duration::from_millis(100))? {
+            let result = match event::read()? {
+                Event::Key(key) if key.kind == crossterm::event::KeyEventKind::Press => {
+                    handle_key(app, key, database, paths, config)
+                }
+                Event::Paste(value) => {
+                    handle_paste(app, &value);
+                    Ok(())
+                }
+                _ => Ok(()),
+            };
+            if let Err(error) = result {
+                app.mode = Mode::Browse;
+                app.status = format!("Error: {error:#}");
+            }
         }
     }
     Ok(())
@@ -361,8 +655,12 @@ fn handle_key(
     paths: &AppPaths,
     config: &Config,
 ) -> Result<()> {
+    if matches!(&app.mode, Mode::FilterEditor(_)) {
+        return handle_filter_editor_key(app, key, database, paths);
+    }
     match &mut app.mode {
         Mode::Browse => handle_browse_key(app, key, database, paths, config),
+        Mode::FilterEditor(_) => unreachable!("filter editor handled above"),
         Mode::Help => {
             app.mode = Mode::Browse;
             Ok(())
@@ -382,7 +680,7 @@ fn handle_key(
             }
             KeyCode::Enter => {
                 let value = value.trim().to_owned();
-                let action = std::mem::replace(action, InputAction::Filter);
+                let action = *action;
                 app.mode = Mode::Browse;
                 submit_input(app, action, value, database, paths)
             }
@@ -404,6 +702,57 @@ fn handle_key(
             }
             _ => Ok(()),
         },
+    }
+}
+
+fn handle_filter_editor_key(
+    app: &mut App,
+    key: KeyEvent,
+    database: &Database,
+    paths: &AppPaths,
+) -> Result<()> {
+    let command = match &mut app.mode {
+        Mode::FilterEditor(editor) => editor.handle_key(key),
+        _ => return Ok(()),
+    };
+    match command {
+        FilterEditorCommand::Continue => {}
+        FilterEditorCommand::Cancel => app.mode = Mode::Browse,
+        FilterEditorCommand::Reset => {
+            let value = serde_json::to_string_pretty(&FilterSpecV1::default())?;
+            if let Mode::FilterEditor(editor) = &mut app.mode {
+                editor.replace(value);
+            }
+        }
+        FilterEditorCommand::Apply => {
+            let value = match &app.mode {
+                Mode::FilterEditor(editor) => editor.value(),
+                _ => return Ok(()),
+            };
+            match apply_filter(app, &value, database, paths) {
+                Ok(()) => app.mode = Mode::Browse,
+                Err(error) => {
+                    if let Mode::FilterEditor(editor) = &mut app.mode {
+                        editor.error = Some(format!("{error:#}"));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn handle_paste(app: &mut App, value: &str) {
+    match &mut app.mode {
+        Mode::FilterEditor(editor) => editor.insert_text(value),
+        Mode::Input {
+            value: input_value, ..
+        } => input_value.extend(
+            value
+                .chars()
+                .filter(|character| !matches!(character, '\r' | '\n') && !character.is_control()),
+        ),
+        _ => {}
     }
 }
 
@@ -430,10 +779,9 @@ fn handle_browse_key(
         }
         KeyCode::Char('?') => app.mode = Mode::Help,
         KeyCode::Char('/') => {
-            app.mode = Mode::Input {
-                action: InputAction::Filter,
-                value: serde_json::to_string(&app.filter)?,
-            };
+            app.mode = Mode::FilterEditor(FilterEditor::new(serde_json::to_string_pretty(
+                &app.filter,
+            )?));
         }
         KeyCode::Char('t') => {
             app.mode = Mode::Input {
@@ -495,18 +843,6 @@ fn submit_input(
     paths: &AppPaths,
 ) -> Result<()> {
     match action {
-        InputAction::Filter => {
-            let filter = if value.is_empty() {
-                FilterSpecV1::default()
-            } else {
-                serde_json::from_str::<FilterSpecV1>(&value)
-                    .context("filter must be valid FilterSpecV1 JSON")?
-            };
-            filter.validate()?;
-            app.filter = filter;
-            app.reload(database, paths)?;
-            app.status = format!("Filter applied — {} result(s)", app.images.len());
-        }
         InputAction::Tag => {
             if !value.is_empty()
                 && let Some(image) = app.selected()
@@ -574,6 +910,24 @@ fn submit_input(
             }
         }
     }
+    Ok(())
+}
+
+fn apply_filter(app: &mut App, value: &str, database: &Database, paths: &AppPaths) -> Result<()> {
+    let filter = if value.trim().is_empty() {
+        FilterSpecV1::default()
+    } else {
+        serde_json::from_str::<FilterSpecV1>(value)
+            .context("filter must be valid FilterSpecV1 JSON")?
+    };
+    filter.validate()?;
+
+    let previous_filter = std::mem::replace(&mut app.filter, filter);
+    if let Err(error) = app.reload(database, paths) {
+        app.filter = previous_filter;
+        return Err(error);
+    }
+    app.status = format!("Filter applied — {} result(s)", app.images.len());
     Ok(())
 }
 
@@ -787,15 +1141,16 @@ fn metadata_text(image: &ImageRecord) -> Text<'static> {
     Text::from(lines)
 }
 
-fn render_modal(frame: &mut Frame<'_>, app: &App) {
-    match &app.mode {
+fn render_modal(frame: &mut Frame<'_>, app: &mut App) {
+    match &mut app.mode {
         Mode::Browse => {}
+        Mode::FilterEditor(editor) => render_filter_editor(frame, editor),
         Mode::Help => {
-            let area = centered_rect(72, 70, frame.area());
+            let area = centered_rect(76, 86, frame.area());
             frame.render_widget(Clear, area);
             frame.render_widget(
                 Paragraph::new(
-                    "Keyboard\n\n↑/↓, j/k  navigate\n/          edit full FilterSpecV1 JSON\nf          toggle favorite\nt          add a custom tag\nc          save/load/list/delete collections\nm          preview move of selected image\nw          bind or unbind a wpaperd display\ns          background scan and GPU analysis\no, Enter   open with xdg-open\nq          quit\n\nPress any key to close.",
+                    "Keyboard\n\n↑/↓, j/k  navigate\n/          edit full FilterSpecV1 JSON\nf          toggle favorite\nt          add a custom tag\nc          save/load/list/delete collections\nm          preview move of selected image\nw          bind or unbind a wpaperd display\ns          background scan and GPU analysis\no, Enter   open with xdg-open\nq          quit\n\nFilter editor\nArrow keys  move cursor\nHome/End    start/end of line\nPgUp/PgDn  scroll through document\nEnter       insert line\nCtrl+S      apply filter\nCtrl+R      reset every facet\nEsc         cancel\n\nPress any key to close.",
                 )
                 .wrap(Wrap { trim: false })
                 .block(Block::default().borders(Borders::ALL).title(" Help ")),
@@ -804,10 +1159,6 @@ fn render_modal(frame: &mut Frame<'_>, app: &App) {
         }
         Mode::Input { action, value } => {
             let (title, hint) = match action {
-                InputAction::Filter => (
-                    " Filter editor ",
-                    "FilterSpecV1 JSON; empty resets every facet",
-                ),
                 InputAction::Tag => (" Add tag ", "tag for selected image"),
                 InputAction::Collection => (
                     " Manage collections ",
@@ -867,6 +1218,100 @@ fn render_modal(frame: &mut Frame<'_>, app: &App) {
                 area,
             );
         }
+    }
+}
+
+fn render_filter_editor(frame: &mut Frame<'_>, editor: &mut FilterEditor) {
+    let area = centered_rect(92, 88, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Filter editor — FilterSpecV1 JSON ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(3),
+        ])
+        .split(inner);
+
+    frame.render_widget(
+        Paragraph::new("Edit JSON directly • facets use AND; array values use OR")
+            .style(Style::default().fg(Color::DarkGray)),
+        sections[0],
+    );
+
+    let editor_area = sections[1];
+    let line_number_width = editor.lines.len().to_string().len();
+    let gutter_width = u16::try_from(line_number_width + 3)
+        .unwrap_or(u16::MAX)
+        .min(editor_area.width);
+    let content_width = editor_area.width.saturating_sub(gutter_width);
+    editor.ensure_cursor_visible(usize::from(content_width), usize::from(editor_area.height));
+
+    let lines = editor
+        .lines
+        .iter()
+        .enumerate()
+        .skip(editor.scroll_line)
+        .take(usize::from(editor_area.height))
+        .map(|(index, line)| {
+            let number = format!("{:>line_number_width$} │ ", index + 1);
+            Line::from(vec![
+                Span::styled(number, Style::default().fg(Color::DarkGray)),
+                Span::raw(visible_text(
+                    line,
+                    editor.scroll_column,
+                    usize::from(content_width),
+                )),
+            ])
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines), editor_area);
+
+    let visible_end =
+        (editor.scroll_line + usize::from(editor_area.height)).min(editor.lines.len());
+    let location = format!(
+        "Ln {}, Col {} • showing lines {}–{} of {}",
+        editor.cursor_line + 1,
+        editor.cursor_column + 1,
+        editor.scroll_line + 1,
+        visible_end,
+        editor.lines.len()
+    );
+    let feedback = editor.error.as_ref().map_or_else(
+        || Span::styled(location, Style::default().fg(Color::DarkGray)),
+        |error| Span::styled(format!("Error: {error}"), Style::default().fg(Color::Red)),
+    );
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from("Arrows/Home/End/PgUp/PgDn move • Enter inserts a line"),
+            Line::from("Ctrl+S apply • Ctrl+R reset • Esc cancel"),
+            Line::from(feedback),
+        ]),
+        sections[2],
+    );
+
+    if content_width > 0 && editor_area.height > 0 {
+        let cursor_x = display_width(
+            &editor.lines[editor.cursor_line],
+            editor.scroll_column,
+            editor.cursor_column,
+        );
+        let cursor_x = u16::try_from(cursor_x)
+            .unwrap_or(u16::MAX)
+            .min(content_width.saturating_sub(1));
+        let cursor_y = u16::try_from(editor.cursor_line.saturating_sub(editor.scroll_line))
+            .unwrap_or(u16::MAX)
+            .min(editor_area.height.saturating_sub(1));
+        frame.set_cursor_position((
+            editor_area.x + gutter_width + cursor_x,
+            editor_area.y + cursor_y,
+        ));
     }
 }
 
@@ -953,15 +1398,12 @@ mod tests {
             .join("\n")
     }
 
-    #[test]
-    fn browser_screen_snapshot() {
-        let backend = TestBackend::new(120, 32);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        let app = App {
+    fn mock_app(mode: Mode) -> App {
+        App {
             images: vec![mock_image()],
             selected: 0,
             filter: FilterSpecV1::default(),
-            mode: Mode::Browse,
+            mode,
             status: "Ready — ? for help".into(),
             picker: Picker::halfblocks(),
             preview: None,
@@ -970,7 +1412,189 @@ mod tests {
             scan_started: None,
             scan_total: None,
             should_quit: false,
+        }
+    }
+
+    fn press(editor: &mut FilterEditor, code: KeyCode) {
+        assert!(matches!(
+            editor.handle_key(KeyEvent::new(code, KeyModifiers::NONE)),
+            FilterEditorCommand::Continue
+        ));
+    }
+
+    fn press_control(editor: &mut FilterEditor, code: KeyCode) -> FilterEditorCommand {
+        editor.handle_key(KeyEvent::new(code, KeyModifiers::CONTROL))
+    }
+
+    fn empty_runtime() -> (tempfile::TempDir, AppPaths, Database, App) {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let paths = AppPaths::from_xdg_roots(
+            directory.path().join("config"),
+            directory.path().join("data"),
+            directory.path().join("cache"),
+            directory.path().join("state"),
+        );
+        paths.ensure_owned_dirs().expect("paths");
+        let database = Database::open(&paths.database).expect("database");
+        let app = App::new(&database, &paths).expect("app");
+        (directory, paths, database, app)
+    }
+
+    #[test]
+    fn filter_editor_navigates_and_edits_across_lines() {
+        let mut editor = FilterEditor::new("abcdef\nx\nabcdef".into());
+
+        press(&mut editor, KeyCode::End);
+        press(&mut editor, KeyCode::Down);
+        assert_eq!((editor.cursor_line, editor.cursor_column), (1, 1));
+        press(&mut editor, KeyCode::Down);
+        assert_eq!((editor.cursor_line, editor.cursor_column), (2, 6));
+
+        press(&mut editor, KeyCode::Home);
+        press(&mut editor, KeyCode::Backspace);
+        assert_eq!(editor.value(), "abcdef\nxabcdef");
+        assert_eq!((editor.cursor_line, editor.cursor_column), (1, 1));
+
+        press(&mut editor, KeyCode::Delete);
+        press(&mut editor, KeyCode::Char('界'));
+        assert_eq!(editor.value(), "abcdef\nx界bcdef");
+        press(&mut editor, KeyCode::Backspace);
+        assert_eq!(editor.value(), "abcdef\nxbcdef");
+    }
+
+    #[test]
+    fn filter_editor_accepts_multiline_paste() {
+        let mut editor = FilterEditor::new(String::new());
+        editor.insert_text("{\r\n\t\"tags\": [\"café\"]\r\n}");
+
+        assert_eq!(editor.value(), "{\n  \"tags\": [\"café\"]\n}");
+        assert_eq!((editor.cursor_line, editor.cursor_column), (2, 1));
+    }
+
+    #[test]
+    fn filter_editor_scrolls_to_keep_cursor_visible() {
+        let value = (0..20)
+            .map(|index| format!("line {index:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut editor = FilterEditor::new(value);
+        assert!(matches!(
+            press_control(&mut editor, KeyCode::End),
+            FilterEditorCommand::Continue
+        ));
+
+        editor.ensure_cursor_visible(5, 4);
+
+        assert_eq!(editor.scroll_line, 16);
+        assert_eq!(editor.scroll_column, 3);
+        assert_eq!(
+            display_width(
+                &editor.lines[editor.cursor_line],
+                editor.scroll_column,
+                editor.cursor_column,
+            ),
+            4
+        );
+        assert_eq!(visible_text("a界b", 0, 3), "a界");
+    }
+
+    #[test]
+    fn filter_editor_commands_do_not_modify_the_document() {
+        let mut editor = FilterEditor::new("{}".into());
+
+        assert!(matches!(
+            press_control(&mut editor, KeyCode::Char('s')),
+            FilterEditorCommand::Apply
+        ));
+        assert!(matches!(
+            press_control(&mut editor, KeyCode::Char('r')),
+            FilterEditorCommand::Reset
+        ));
+        assert!(matches!(
+            editor.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            FilterEditorCommand::Cancel
+        ));
+        assert_eq!(editor.value(), "{}");
+    }
+
+    #[test]
+    fn invalid_filter_stays_open_for_correction() {
+        let (_directory, paths, database, mut app) = empty_runtime();
+        app.mode = Mode::FilterEditor(FilterEditor::new("{".into()));
+
+        handle_filter_editor_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            &database,
+            &paths,
+        )
+        .expect("handle key");
+
+        let Mode::FilterEditor(editor) = &app.mode else {
+            panic!("invalid filter closed the editor");
         };
+        assert!(
+            editor
+                .error
+                .as_deref()
+                .is_some_and(|error| { error.contains("filter must be valid FilterSpecV1 JSON") })
+        );
+    }
+
+    #[test]
+    fn valid_partial_filter_applies_and_closes_the_editor() {
+        let (_directory, paths, database, mut app) = empty_runtime();
+        app.mode = Mode::FilterEditor(FilterEditor::new(
+            r#"{"min_width":2560,"orientations":["landscape"]}"#.into(),
+        ));
+
+        handle_filter_editor_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            &database,
+            &paths,
+        )
+        .expect("handle key");
+
+        assert!(matches!(app.mode, Mode::Browse));
+        assert_eq!(app.filter.min_width, Some(2560));
+        assert_eq!(app.filter.orientations.len(), 1);
+        assert_eq!(app.status, "Filter applied — 0 result(s)");
+    }
+
+    #[test]
+    fn filter_editor_renders_the_full_document_with_scrolling() {
+        let value = serde_json::to_string_pretty(&FilterSpecV1::default()).expect("serialize");
+        let mut app = mock_app(Mode::FilterEditor(FilterEditor::new(value)));
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| render_modal(frame, &mut app))
+            .expect("draw top");
+        let top = buffer_text(&terminal);
+        assert!(top.contains("\"version\": 1"));
+        assert!(top.contains("Ctrl+S apply"));
+
+        if let Mode::FilterEditor(editor) = &mut app.mode {
+            assert!(matches!(
+                press_control(editor, KeyCode::End),
+                FilterEditorCommand::Continue
+            ));
+        }
+        terminal
+            .draw(|frame| render_modal(frame, &mut app))
+            .expect("draw bottom");
+        let bottom = buffer_text(&terminal);
+        assert!(bottom.contains("\"favorite\": null"));
+        assert!(bottom.contains("showing lines"));
+    }
+
+    #[test]
+    fn browser_screen_snapshot() {
+        let backend = TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let app = mock_app(Mode::Browse);
         terminal
             .draw(|frame| {
                 let areas = render_base(frame, &app);
