@@ -1,0 +1,988 @@
+use std::{
+    path::PathBuf,
+    process::Command,
+    thread,
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context, Result};
+use crossbeam_channel::{Receiver, TryRecvError, unbounded};
+use crossterm::{
+    cursor::Show,
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    },
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
+use ratatui::{
+    Frame, Terminal,
+    backend::CrosstermBackend,
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span, Text},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+};
+use ratatui_image::{Resize, StatefulImage, picker::Picker, protocol::StatefulProtocol};
+
+use crate::{
+    AppPaths,
+    collection::{
+        add_tag, delete_collection, get_collection, list_collections, save_collection,
+        search_resolved, set_favorite,
+    },
+    config::Config,
+    db::{Database, ImageRecord},
+    filter::FilterSpecV1,
+    model,
+    move_files::{MovePlan, apply_move, plan_move},
+    scan::{ScanEvent, ScanOptions, ScanReport, scan_catalog_with_progress},
+    wpaperd,
+};
+
+enum InputAction {
+    Filter,
+    Tag,
+    Collection,
+    Move,
+    Bind,
+}
+
+enum Mode {
+    Browse,
+    Input { action: InputAction, value: String },
+    ConfirmMove(MovePlan),
+    Help,
+}
+
+enum BackgroundResult {
+    Progress(ScanEvent),
+    Finished {
+        scan: ScanReport,
+        ai: Option<model::AiReport>,
+    },
+    Failed(String),
+}
+
+struct App {
+    images: Vec<ImageRecord>,
+    selected: usize,
+    filter: FilterSpecV1,
+    mode: Mode,
+    status: String,
+    picker: Picker,
+    preview: Option<StatefulProtocol>,
+    preview_id: Option<i64>,
+    scan_receiver: Option<Receiver<BackgroundResult>>,
+    scan_started: Option<Instant>,
+    scan_total: Option<usize>,
+    should_quit: bool,
+}
+
+impl App {
+    fn new(database: &Database, paths: &AppPaths) -> Result<Self> {
+        let filter = FilterSpecV1::default();
+        let images = search_resolved(database, paths, &filter)?
+            .into_iter()
+            .map(|result| result.image)
+            .collect();
+        let picker = if std::env::var_os("KITTY_WINDOW_ID").is_some()
+            || std::env::var("TERM").is_ok_and(|term| term.contains("kitty"))
+        {
+            Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks())
+        } else {
+            Picker::halfblocks()
+        };
+        let mut app = Self {
+            images,
+            selected: 0,
+            filter,
+            mode: Mode::Browse,
+            status: "Ready — ? for help".into(),
+            picker,
+            preview: None,
+            preview_id: None,
+            scan_receiver: None,
+            scan_started: None,
+            scan_total: None,
+            should_quit: false,
+        };
+        app.load_preview();
+        Ok(app)
+    }
+
+    fn selected(&self) -> Option<&ImageRecord> {
+        self.images.get(self.selected)
+    }
+
+    fn reload(&mut self, database: &Database, paths: &AppPaths) -> Result<()> {
+        let selected_id = self.selected().map(|image| image.id);
+        if self.filter.semantic_text.is_some() && !model::status(paths, false).verified {
+            anyhow::bail!(
+                "semantic TUI filters need the model installed first; run `bgm model install --yes`"
+            );
+        }
+        self.images = search_resolved(database, paths, &self.filter)?
+            .into_iter()
+            .map(|result| result.image)
+            .collect();
+        self.selected = selected_id
+            .and_then(|id| self.images.iter().position(|image| image.id == id))
+            .unwrap_or(0)
+            .min(self.images.len().saturating_sub(1));
+        self.preview_id = None;
+        self.load_preview();
+        Ok(())
+    }
+
+    fn load_preview(&mut self) {
+        let Some(image) = self.selected() else {
+            self.preview = None;
+            self.preview_id = None;
+            return;
+        };
+        if self.preview_id == Some(image.id) {
+            return;
+        }
+        let id = image.id;
+        let path = image.thumbnail_path.as_ref().unwrap_or(&image.path).clone();
+        match image::open(&path) {
+            Ok(image) => {
+                self.preview = Some(self.picker.new_resize_protocol(image));
+                self.preview_id = Some(id);
+            }
+            Err(error) => {
+                self.preview = None;
+                self.preview_id = Some(id);
+                self.status = format!("Preview unavailable: {error}");
+            }
+        }
+    }
+
+    fn move_selection(&mut self, amount: isize) {
+        if self.images.is_empty() {
+            return;
+        }
+        self.selected = self
+            .selected
+            .saturating_add_signed(amount)
+            .min(self.images.len() - 1);
+        self.load_preview();
+    }
+
+    fn start_scan(&mut self, database: &Database, paths: &AppPaths, config: &Config) {
+        if self.scan_receiver.is_some() {
+            self.status = "A scan is already running".into();
+            return;
+        }
+        let database_path = database.path().to_owned();
+        let paths = paths.clone();
+        let config = config.clone();
+        let (sender, receiver) = unbounded();
+        thread::spawn(move || {
+            let result = (|| -> Result<BackgroundResult> {
+                let database = Database::open(database_path)?;
+                let progress_sender = sender.clone();
+                let scan = scan_catalog_with_progress(
+                    &database,
+                    &paths,
+                    &config,
+                    ScanOptions {
+                        full: false,
+                        no_ai: !config.ai.enabled,
+                    },
+                    move |event| {
+                        if !matches!(event, ScanEvent::Finished(_)) {
+                            let _ = progress_sender.send(BackgroundResult::Progress(event));
+                        }
+                    },
+                )?;
+                let ai = if config.ai.enabled && model::status(&paths, false).verified {
+                    Some(model::analyze_missing(&database, &paths)?)
+                } else {
+                    None
+                };
+                let _ = wpaperd::refresh(&database, &paths, None);
+                Ok(BackgroundResult::Finished { scan, ai })
+            })()
+            .unwrap_or_else(|error| BackgroundResult::Failed(format!("{error:#}")));
+            let _ = sender.send(result);
+        });
+        self.scan_receiver = Some(receiver);
+        self.scan_started = Some(Instant::now());
+        self.scan_total = None;
+        self.status = "Scanning in background…".into();
+    }
+
+    fn poll_scan(&mut self, database: &Database, paths: &AppPaths) -> Result<()> {
+        let Some(receiver) = self.scan_receiver.clone() else {
+            return Ok(());
+        };
+        loop {
+            match receiver.try_recv() {
+                Ok(BackgroundResult::Progress(ScanEvent::Started { files })) => {
+                    self.scan_total = Some(files);
+                    self.status = format!("Scanning 0/{files}…");
+                }
+                Ok(BackgroundResult::Progress(ScanEvent::Processing { index, path })) => {
+                    let total = self
+                        .scan_total
+                        .map_or_else(|| "?".into(), |value| value.to_string());
+                    self.status = format!("Scanning {index}/{total}: {}", path.display());
+                }
+                Ok(BackgroundResult::Progress(ScanEvent::Failed(failure))) => {
+                    self.status = format!(
+                        "Scan warning for {}: {}",
+                        failure.path.display(),
+                        failure.error
+                    );
+                }
+                Ok(BackgroundResult::Progress(ScanEvent::Finished(_))) => {}
+                Ok(BackgroundResult::Finished { scan, ai }) => {
+                    let elapsed = self
+                        .scan_started
+                        .map_or(0.0, |start| start.elapsed().as_secs_f32());
+                    self.status = format!(
+                        "Scan finished in {elapsed:.1}s: {} analyzed, {} unchanged, {} failure(s){}",
+                        scan.analyzed,
+                        scan.unchanged,
+                        scan.failed,
+                        ai.as_ref().map_or_else(String::new, |report| {
+                            format!(", {} AI embeddings", report.embedded)
+                        })
+                    );
+                    if let Some(failure) = scan.failures.first() {
+                        self.status.push_str(&format!(
+                            " — {}: {}",
+                            failure.path.display(),
+                            failure.error
+                        ));
+                    }
+                    self.scan_receiver = None;
+                    self.scan_started = None;
+                    self.scan_total = None;
+                    self.reload(database, paths)?;
+                    break;
+                }
+                Ok(BackgroundResult::Failed(error)) => {
+                    self.status = format!("Background scan failed: {error}");
+                    self.scan_receiver = None;
+                    self.scan_started = None;
+                    self.scan_total = None;
+                    break;
+                }
+                Err(TryRecvError::Empty) => {
+                    if self.scan_total.is_none()
+                        && let Some(started) = self.scan_started
+                    {
+                        self.status = format!(
+                            "Scanning in background… {:.1}s",
+                            started.elapsed().as_secs_f32()
+                        );
+                    }
+                    break;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.status = "Background scan stopped unexpectedly".into();
+                    self.scan_receiver = None;
+                    self.scan_started = None;
+                    self.scan_total = None;
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+pub fn run(database: &Database, paths: &AppPaths, config: &Config) -> Result<()> {
+    let mut app = App::new(database, paths)?;
+    enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
+        let _ = disable_raw_mode();
+        let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture, Show);
+        return Err(error.into());
+    }
+    let cleanup = TerminalCleanup;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
+
+    let result = run_loop(&mut terminal, &mut app, database, paths, config);
+
+    drop(terminal);
+    drop(cleanup);
+    result
+}
+
+struct TerminalCleanup;
+
+impl Drop for TerminalCleanup {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            std::io::stdout(),
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            Show
+        );
+    }
+}
+
+fn run_loop(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    app: &mut App,
+    database: &Database,
+    paths: &AppPaths,
+    config: &Config,
+) -> Result<()> {
+    while !app.should_quit {
+        if let Err(error) = app.poll_scan(database, paths) {
+            app.status = format!("Background result error: {error:#}");
+        }
+        terminal.draw(|frame| draw(frame, app))?;
+        if event::poll(Duration::from_millis(100))?
+            && let Event::Key(key) = event::read()?
+            && key.kind == crossterm::event::KeyEventKind::Press
+            && let Err(error) = handle_key(app, key, database, paths, config)
+        {
+            app.mode = Mode::Browse;
+            app.status = format!("Error: {error:#}");
+        }
+    }
+    Ok(())
+}
+
+fn handle_key(
+    app: &mut App,
+    key: KeyEvent,
+    database: &Database,
+    paths: &AppPaths,
+    config: &Config,
+) -> Result<()> {
+    match &mut app.mode {
+        Mode::Browse => handle_browse_key(app, key, database, paths, config),
+        Mode::Help => {
+            app.mode = Mode::Browse;
+            Ok(())
+        }
+        Mode::Input { action, value } => match key.code {
+            KeyCode::Esc => {
+                app.mode = Mode::Browse;
+                Ok(())
+            }
+            KeyCode::Backspace => {
+                value.pop();
+                Ok(())
+            }
+            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                value.push(character);
+                Ok(())
+            }
+            KeyCode::Enter => {
+                let value = value.trim().to_owned();
+                let action = std::mem::replace(action, InputAction::Filter);
+                app.mode = Mode::Browse;
+                submit_input(app, action, value, database, paths)
+            }
+            _ => Ok(()),
+        },
+        Mode::ConfirmMove(plan) => match key.code {
+            KeyCode::Char('y' | 'Y') => {
+                let plan = plan.clone();
+                app.mode = Mode::Browse;
+                let result = apply_move(database, paths, plan)?;
+                app.status = format!("Moved {} file(s); undo ID {}", result.moved, result.id);
+                let _ = wpaperd::refresh(database, paths, None);
+                app.reload(database, paths)
+            }
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                app.mode = Mode::Browse;
+                app.status = "Move cancelled".into();
+                Ok(())
+            }
+            _ => Ok(()),
+        },
+    }
+}
+
+fn handle_browse_key(
+    app: &mut App,
+    key: KeyEvent,
+    database: &Database,
+    paths: &AppPaths,
+    config: &Config,
+) -> Result<()> {
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
+        KeyCode::Down | KeyCode::Char('j') => app.move_selection(1),
+        KeyCode::Up | KeyCode::Char('k') => app.move_selection(-1),
+        KeyCode::PageDown => app.move_selection(10),
+        KeyCode::PageUp => app.move_selection(-10),
+        KeyCode::Home | KeyCode::Char('g') => {
+            app.selected = 0;
+            app.load_preview();
+        }
+        KeyCode::End | KeyCode::Char('G') => {
+            app.selected = app.images.len().saturating_sub(1);
+            app.load_preview();
+        }
+        KeyCode::Char('?') => app.mode = Mode::Help,
+        KeyCode::Char('/') => {
+            app.mode = Mode::Input {
+                action: InputAction::Filter,
+                value: serde_json::to_string(&app.filter)?,
+            };
+        }
+        KeyCode::Char('t') => {
+            app.mode = Mode::Input {
+                action: InputAction::Tag,
+                value: String::new(),
+            };
+        }
+        KeyCode::Char('c') => {
+            app.mode = Mode::Input {
+                action: InputAction::Collection,
+                value: String::new(),
+            };
+        }
+        KeyCode::Char('m') => {
+            app.mode = Mode::Input {
+                action: InputAction::Move,
+                value: String::new(),
+            };
+        }
+        KeyCode::Char('w') => {
+            app.mode = Mode::Input {
+                action: InputAction::Bind,
+                value: "any ".into(),
+            };
+        }
+        KeyCode::Char('f') => {
+            if let Some(image) = app.selected() {
+                let (id, favorite) = (image.id, !image.favorite);
+                set_favorite(database, &[id], favorite)?;
+                let _ = wpaperd::refresh(database, paths, None);
+                app.reload(database, paths)?;
+                app.status = if favorite {
+                    "Marked favorite".into()
+                } else {
+                    "Removed favorite".into()
+                };
+            }
+        }
+        KeyCode::Char('o') | KeyCode::Enter => {
+            if let Some(image) = app.selected() {
+                Command::new("xdg-open")
+                    .arg(&image.path)
+                    .spawn()
+                    .context("failed to start xdg-open")?;
+                app.status = format!("Opened {}", image.path.display());
+            }
+        }
+        KeyCode::Char('s') => app.start_scan(database, paths, config),
+        _ => {}
+    }
+    Ok(())
+}
+
+fn submit_input(
+    app: &mut App,
+    action: InputAction,
+    value: String,
+    database: &Database,
+    paths: &AppPaths,
+) -> Result<()> {
+    match action {
+        InputAction::Filter => {
+            let filter = if value.is_empty() {
+                FilterSpecV1::default()
+            } else {
+                serde_json::from_str::<FilterSpecV1>(&value)
+                    .context("filter must be valid FilterSpecV1 JSON")?
+            };
+            filter.validate()?;
+            app.filter = filter;
+            app.reload(database, paths)?;
+            app.status = format!("Filter applied — {} result(s)", app.images.len());
+        }
+        InputAction::Tag => {
+            if !value.is_empty()
+                && let Some(image) = app.selected()
+            {
+                add_tag(database, &[image.id], &value)?;
+                let _ = wpaperd::refresh(database, paths, None);
+                app.reload(database, paths)?;
+                app.status = format!("Added tag {value}");
+            }
+        }
+        InputAction::Collection => {
+            if value.eq_ignore_ascii_case("list") {
+                let names = list_collections(database)?
+                    .into_iter()
+                    .map(|collection| collection.name)
+                    .collect::<Vec<_>>();
+                app.status = if names.is_empty() {
+                    "No saved collections".into()
+                } else {
+                    format!("Collections: {}", names.join(", "))
+                };
+            } else if let Some(name) = value.strip_prefix("load ").map(str::trim) {
+                let collection = get_collection(database, name)?
+                    .with_context(|| format!("collection not found: {name}"))?;
+                app.filter = collection.filter;
+                app.reload(database, paths)?;
+                app.status = format!("Loaded collection {}", collection.name);
+            } else if let Some(name) = value.strip_prefix("delete ").map(str::trim) {
+                if !delete_collection(database, name)? {
+                    anyhow::bail!("collection not found: {name}");
+                }
+                let _ = wpaperd::refresh(database, paths, None);
+                app.status = format!("Deleted collection {name}");
+            } else if !value.is_empty() {
+                let name = value
+                    .strip_prefix("save ")
+                    .map_or(value.as_str(), str::trim);
+                let collection = save_collection(database, name, &app.filter)?;
+                let _ = wpaperd::refresh(database, paths, None);
+                app.status = format!("Saved collection {}", collection.name);
+            }
+        }
+        InputAction::Move => {
+            if !value.is_empty()
+                && let Some(image) = app.selected()
+            {
+                let plan = plan_move(std::slice::from_ref(image), &PathBuf::from(value))?;
+                app.mode = Mode::ConfirmMove(plan);
+            }
+        }
+        InputAction::Bind => {
+            if let Some(display) = value.strip_prefix("unbind ").map(str::trim) {
+                let result = wpaperd::unbind(database, paths, display)?;
+                app.status = if result.restored {
+                    format!("Unbound {display} and restored its previous path")
+                } else {
+                    format!("Unbound {display}; externally edited path was preserved")
+                };
+            } else {
+                let (display, collection) = value
+                    .split_once(char::is_whitespace)
+                    .context("binding input must be DISPLAY COLLECTION or `unbind DISPLAY`")?;
+                let binding = wpaperd::bind(database, paths, display, collection.trim())?;
+                app.status = format!("Bound {} to {}", binding.display, binding.collection_name);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn draw(frame: &mut Frame<'_>, app: &mut App) {
+    let areas = render_base(frame, app);
+    if let Some(preview) = app.preview.as_mut() {
+        frame.render_stateful_widget(
+            StatefulImage::new().resize(Resize::Fit(None)),
+            areas.preview,
+            preview,
+        );
+    } else {
+        frame.render_widget(
+            Paragraph::new("No preview\n\nPress Enter or o to use xdg-open")
+                .alignment(Alignment::Center)
+                .block(Block::default().borders(Borders::ALL).title(" Preview ")),
+            areas.preview,
+        );
+    }
+    render_modal(frame, app);
+}
+
+struct ScreenAreas {
+    preview: Rect,
+}
+
+fn render_base(frame: &mut Frame<'_>, app: &App) -> ScreenAreas {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(10),
+            Constraint::Length(2),
+        ])
+        .split(frame.area());
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(34),
+            Constraint::Percentage(40),
+            Constraint::Percentage(26),
+        ])
+        .split(vertical[1]);
+
+    let title = format!(
+        " bgm — {} wallpaper{} — filter v{} ",
+        app.images.len(),
+        if app.images.len() == 1 { "" } else { "s" },
+        app.filter.version
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                "Background Manager",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  native catalog • collections • wpaperd"),
+        ]))
+        .block(Block::default().borders(Borders::ALL).title(title)),
+        vertical[0],
+    );
+
+    let items: Vec<_> = app
+        .images
+        .iter()
+        .map(|image| {
+            let favorite = if image.favorite { "★" } else { " " };
+            let dimensions = match (image.width, image.height) {
+                (Some(width), Some(height)) => format!("{width}×{height}"),
+                _ => "?×?".into(),
+            };
+            let name = image.path.file_name().map_or_else(
+                || image.path.display().to_string(),
+                |name| name.to_string_lossy().into(),
+            );
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{favorite} "), Style::default().fg(Color::Yellow)),
+                Span::raw(format!("{name}  ")),
+                Span::styled(dimensions, Style::default().fg(Color::DarkGray)),
+            ]))
+        })
+        .collect();
+    let mut list_state =
+        ListState::default().with_selected((!app.images.is_empty()).then_some(app.selected));
+    frame.render_stateful_widget(
+        List::new(items)
+            .highlight_symbol("▸ ")
+            .highlight_style(
+                Style::default()
+                    .bg(Color::Rgb(35, 48, 65))
+                    .add_modifier(Modifier::BOLD),
+            )
+            .block(Block::default().borders(Borders::ALL).title(" Results ")),
+        body[0],
+        &mut list_state,
+    );
+
+    let metadata = app
+        .selected()
+        .map_or_else(|| Text::from("No matching images"), metadata_text);
+    frame.render_widget(
+        Paragraph::new(metadata).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Metadata • palette • AI estimates "),
+        ),
+        body[2],
+    );
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("↑/↓", Style::default().fg(Color::Cyan)),
+            Span::raw(" navigate  "),
+            Span::styled("/", Style::default().fg(Color::Cyan)),
+            Span::raw(" filter  f favorite  t tag  c collection  m move  w bind  s scan  o open  ? help  q quit"),
+        ]))
+        .block(Block::default().borders(Borders::TOP)),
+        vertical[2],
+    );
+    let status_area = Rect {
+        x: vertical[0].x + 2,
+        y: vertical[0].y + 1,
+        width: vertical[0].width.saturating_sub(4),
+        height: 1,
+    };
+    frame.render_widget(
+        Paragraph::new(app.status.as_str()).alignment(Alignment::Right),
+        status_area,
+    );
+    ScreenAreas { preview: body[1] }
+}
+
+fn metadata_text(image: &ImageRecord) -> Text<'static> {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            image.path.display().to_string(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(format!(
+            "{} × {}   ratio {}   {}",
+            image
+                .width
+                .map_or_else(|| "?".into(), |value| value.to_string()),
+            image
+                .height
+                .map_or_else(|| "?".into(), |value| value.to_string()),
+            image.common_ratio.as_deref().unwrap_or("custom"),
+            image.orientation.as_deref().unwrap_or("unknown")
+        )),
+        Line::from(format!(
+            "dominant {} {}   {}",
+            image.dominant_hex.as_deref().unwrap_or("—"),
+            image.dominant_name.as_deref().unwrap_or(""),
+            image.light_dark.as_deref().unwrap_or("unknown")
+        )),
+        Line::from(format!(
+            "luminance {:.3}  saturation {:.3}  contrast {:.3}",
+            image.luminance.unwrap_or_default(),
+            image.saturation.unwrap_or_default(),
+            image.contrast.unwrap_or_default()
+        )),
+        Line::from(""),
+        Line::from(Span::styled("Palette", Style::default().fg(Color::Cyan))),
+    ];
+    for colour in &image.palette {
+        let terminal_colour = parse_terminal_colour(&colour.hex).unwrap_or(Color::Reset);
+        lines.push(Line::from(vec![
+            Span::styled("  ", Style::default().bg(terminal_colour)),
+            Span::raw(format!(
+                " {} {:>5.1}%",
+                colour.hex,
+                colour.proportion * 100.0
+            )),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "AI estimates",
+        Style::default().fg(Color::Magenta),
+    )));
+    if image.ai_estimates.is_empty() {
+        lines.push(Line::from("not analyzed"));
+    } else {
+        for estimate in image
+            .ai_estimates
+            .iter()
+            .filter(|estimate| estimate.score >= 0.05)
+            .take(8)
+        {
+            lines.push(Line::from(format!(
+                "{} ≈ {} ({:.0}%)",
+                estimate.pack,
+                estimate.label,
+                estimate.score * 100.0
+            )));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(format!(
+        "tags: {}",
+        if image.tags.is_empty() {
+            "—".into()
+        } else {
+            image.tags.join(", ")
+        }
+    )));
+    Text::from(lines)
+}
+
+fn render_modal(frame: &mut Frame<'_>, app: &App) {
+    match &app.mode {
+        Mode::Browse => {}
+        Mode::Help => {
+            let area = centered_rect(72, 70, frame.area());
+            frame.render_widget(Clear, area);
+            frame.render_widget(
+                Paragraph::new(
+                    "Keyboard\n\n↑/↓, j/k  navigate\n/          edit full FilterSpecV1 JSON\nf          toggle favorite\nt          add a custom tag\nc          save/load/list/delete collections\nm          preview move of selected image\nw          bind or unbind a wpaperd display\ns          background scan and GPU analysis\no, Enter   open with xdg-open\nq          quit\n\nPress any key to close.",
+                )
+                .wrap(Wrap { trim: false })
+                .block(Block::default().borders(Borders::ALL).title(" Help ")),
+                area,
+            );
+        }
+        Mode::Input { action, value } => {
+            let (title, hint) = match action {
+                InputAction::Filter => (
+                    " Filter editor ",
+                    "FilterSpecV1 JSON; empty resets every facet",
+                ),
+                InputAction::Tag => (" Add tag ", "tag for selected image"),
+                InputAction::Collection => (
+                    " Manage collections ",
+                    "NAME/save NAME, load NAME, delete NAME, or list",
+                ),
+                InputAction::Move => (" Move preview ", "destination directory"),
+                InputAction::Bind => (
+                    " Manage wpaperd binding ",
+                    "DISPLAY COLLECTION, or: unbind DISPLAY",
+                ),
+            };
+            let area = centered_rect(70, 22, frame.area());
+            frame.render_widget(Clear, area);
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(hint),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        format!("> {value}█"),
+                        Style::default().fg(Color::Cyan),
+                    )),
+                    Line::from(""),
+                    Line::from("Enter applies • Esc cancels"),
+                ])
+                .block(Block::default().borders(Borders::ALL).title(title)),
+                area,
+            );
+        }
+        Mode::ConfirmMove(plan) => {
+            let area = centered_rect(78, 46, frame.area());
+            frame.render_widget(Clear, area);
+            let mut lines = vec![
+                Line::from(Span::styled(
+                    "Filesystem move preview",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(format!("Destination: {}", plan.destination_root.display())),
+                Line::from(""),
+            ];
+            for item in plan.items.iter().take(8) {
+                lines.push(Line::from(format!(
+                    "{} → {}",
+                    item.original_path.display(),
+                    item.destination.display()
+                )));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from("Apply this move? y = apply • n/Esc = cancel"));
+            frame.render_widget(
+                Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Confirm safe move "),
+                ),
+                area,
+            );
+        }
+    }
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1])[1]
+}
+
+fn parse_terminal_colour(hex: &str) -> Option<Color> {
+    let value = hex.strip_prefix('#')?;
+    if value.len() != 6 {
+        return None;
+    }
+    Some(Color::Rgb(
+        u8::from_str_radix(&value[0..2], 16).ok()?,
+        u8::from_str_radix(&value[2..4], 16).ok()?,
+        u8::from_str_radix(&value[4..6], 16).ok()?,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    use crate::db::ImageStatus;
+
+    use super::*;
+
+    fn mock_image() -> ImageRecord {
+        ImageRecord {
+            id: 1,
+            source_id: 1,
+            path: "/wallpapers/mountain.jpg".into(),
+            size: 100,
+            modified_ns: 0,
+            hash: Some("abc".into()),
+            status: ImageStatus::Ready,
+            error: None,
+            width: Some(1920),
+            height: Some(1080),
+            ratio: Some(16.0 / 9.0),
+            orientation: Some("landscape".into()),
+            common_ratio: Some("16:9".into()),
+            dominant_hex: Some("#204080".into()),
+            dominant_name: Some("blue".into()),
+            luminance: Some(0.3),
+            saturation: Some(0.6),
+            contrast: Some(0.2),
+            light_dark: Some("dark".into()),
+            thumbnail_path: None,
+            palette: Vec::new(),
+            ai_estimates: Vec::new(),
+            favorite: true,
+            tags: vec!["desktop".into()],
+        }
+    }
+
+    fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn browser_screen_snapshot() {
+        let backend = TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let app = App {
+            images: vec![mock_image()],
+            selected: 0,
+            filter: FilterSpecV1::default(),
+            mode: Mode::Browse,
+            status: "Ready — ? for help".into(),
+            picker: Picker::halfblocks(),
+            preview: None,
+            preview_id: None,
+            scan_receiver: None,
+            scan_started: None,
+            scan_total: None,
+            should_quit: false,
+        };
+        terminal
+            .draw(|frame| {
+                let areas = render_base(frame, &app);
+                frame.render_widget(
+                    Paragraph::new("[mock image]")
+                        .alignment(Alignment::Center)
+                        .block(Block::default().borders(Borders::ALL).title(" Preview ")),
+                    areas.preview,
+                );
+            })
+            .expect("draw");
+        let snapshot = buffer_text(&terminal);
+        insta::assert_snapshot!("browser", snapshot);
+    }
+}

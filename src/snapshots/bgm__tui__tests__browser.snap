@@ -1,0 +1,37 @@
+---
+source: src/tui.rs
+assertion_line: 868
+expression: snapshot
+---
+┌ bgm — 1 wallpaper — filter v1 ───────────────────────────────────────────────────────────────────────────────────────┐
+│Background Manager  native catalog • collections • wpaperd                                         Ready — ? for help │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Results ──────────────────────────────┐┌ Preview ─────────────────────────────────────┐┌ Metadata • palette • AI esti┐
+│▸ ★ mountain.jpg  1920×1080            ││                 [mock image]                 ││/wallpapers/mountain.jpg     │
+│                                       ││                                              ││1920 × 1080   ratio 16:9     │
+│                                       ││                                              ││landscape                    │
+│                                       ││                                              ││dominant #204080 blue   dark │
+│                                       ││                                              ││luminance 0.300  saturation  │
+│                                       ││                                              ││0.600  contrast 0.200        │
+│                                       ││                                              ││                             │
+│                                       ││                                              ││Palette                      │
+│                                       ││                                              ││                             │
+│                                       ││                                              ││AI estimates                 │
+│                                       ││                                              ││not analyzed                 │
+│                                       ││                                              ││                             │
+│                                       ││                                              ││tags: desktop                │
+│                                       ││                                              ││                             │
+│                                       ││                                              ││                             │
+│                                       ││                                              ││                             │
+│                                       ││                                              ││                             │
+│                                       ││                                              ││                             │
+│                                       ││                                              ││                             │
+│                                       ││                                              ││                             │
+│                                       ││                                              ││                             │
+│                                       ││                                              ││                             │
+│                                       ││                                              ││                             │
+│                                       ││                                              ││                             │
+│                                       ││                                              ││                             │
+└───────────────────────────────────────┘└──────────────────────────────────────────────┘└─────────────────────────────┘
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+↑/↓ navigate  / filter  f favorite  t tag  c collection  m move  w bind  s scan  o open  ? help  q quit
