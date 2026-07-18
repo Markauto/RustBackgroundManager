@@ -1,0 +1,30 @@
+---
+source: src/tui.rs
+expression: screen
+---
+
+
+
+
+
+
+       ┌ Command palette — bgm commands ──────────────────────────────────────────────────────────────┐
+       │Type a command without the leading `bgm` • quotes and ~/ paths work                           │
+       │┌ Command ───────────────────────────────────────────────────────────────────────────────────┐│
+       ││> collection                                                                                ││
+       │└────────────────────────────────────────────────────────────────────────────────────────────┘│
+       │┌ IntelliSense ──────────────────────────────────────────────────────────────────────────────┐│
+       ││▸ delete                  Delete a saved collection                                         ││
+       ││  list                    List saved collections                                            ││
+       ││  save                    Save a filter as a named collection                               ││
+       ││  show                    Show one saved collection's filter                                ││
+       ││  --help                  Print help                                                        ││
+       ││                                                                                            ││
+       ││                                                                                            ││
+       ││                                                                                            ││
+       │└────────────────────────────────────────────────────────────────────────────────────────────┘│
+       │Tab completes • ↑/↓ selects • Ctrl+P/N history • Enter runs • Esc closes                      │
+       │Only bgm commands run; shell operators and $VARIABLE expansion are not used.                  │
+       │Delete a saved collection                                                                     │
+       │                                                                                              │
+       └──────────────────────────────────────────────────────────────────────────────────────────────┘

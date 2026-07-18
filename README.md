@@ -108,6 +108,7 @@ Scans, moves, label/tag/favorite changes, and collection updates refresh active 
 ## TUI keys
 
 - `↑`/`↓`, `j`/`k`, Page Up/Down, Home/End: navigate results
+- `:`: open the command palette and run any non-TUI `bgm` command
 - `/`: open the filter editor with built-in examples, saved presets, and full `FilterSpecV1` JSON
 - `f`: toggle favorite
 - `t`: add a tag
@@ -117,6 +118,8 @@ Scans, moves, label/tag/favorite changes, and collection updates refresh active 
 - `s`: run scan and optional GPU analysis off the UI thread
 - `o` or Enter: open the original with `xdg-open`
 - `?`: help; `q`: quit
+
+The command palette uses the same Clap command tree as the CLI, so its IntelliSense list follows the current subcommand and suggests flags and enumerated values. It also completes live collection names, registered source paths, label packs, wpaperd displays, catalog tags, and the selected image ID where relevant. Use Up/Down to choose a suggestion, Tab to accept it, Ctrl+P/Ctrl+N for command history, and Enter to validate and run. Commands execute in the background; their stdout and diagnostics open in a scrollable result panel, and the browser refreshes afterward. The optional leading `bgm` is accepted, quotes and `~/` paths work, and nested `tui` launches are refused. The palette invokes `bgm` directly rather than through a shell, so shell operators and environment-variable expansion are intentionally unavailable.
 
 Inside the filter editor, Tab switches between the preset list and pretty-printed JSON. In the preset list, use the arrow keys and Enter to load one of the read-only examples or a saved collection into the editor. Ctrl+P saves the current validated JSON as a named preset; saving an existing name updates it. In the JSON pane, the arrow keys, Home/End, and Page Up/Down move through the document, Enter inserts a line, and Backspace/Delete edit text. Ctrl+S validates and applies the filter, Ctrl+R restores the default filter, and Esc cancels. Parse or validation errors stay open in the editor so they can be corrected. Pasted multiline JSON and preset names are supported.
 

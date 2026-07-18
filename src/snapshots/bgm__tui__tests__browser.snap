@@ -1,6 +1,5 @@
 ---
 source: src/tui.rs
-assertion_line: 868
 expression: snapshot
 ---
 ┌ bgm — 1 wallpaper — filter v1 ───────────────────────────────────────────────────────────────────────────────────────┐
@@ -34,4 +33,4 @@ expression: snapshot
 │                                       ││                                              ││                             │
 └───────────────────────────────────────┘└──────────────────────────────────────────────┘└─────────────────────────────┘
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-↑/↓ navigate  / filter  f favorite  t tag  c collection  m move  w bind  s scan  o open  ? help  q quit
+↑/↓ navigate  / filter  : commands  f favorite  t tag  c collection  m move  w bind  s scan  o open  ? help  q quit

@@ -1,7 +1,7 @@
 use std::{io::Write as _, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -41,6 +41,43 @@ use crate::{
 pub struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CommandSuggestion {
+    pub label: String,
+    pub replacement: String,
+    pub description: String,
+    pub replace_start: usize,
+    pub replace_end: usize,
+    pub append_space: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CommandCompletionContext {
+    pub completed: Vec<String>,
+    pub prefix: String,
+    pub replace_start: usize,
+    pub replace_end: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Quote {
+    Single,
+    Double,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CommandToken {
+    value: String,
+    start: usize,
+    end: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LexedCommandLine {
+    tokens: Vec<CommandToken>,
+    has_active_token: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -109,51 +146,54 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum ConfigCommand {
+    /// Show the active configuration.
     Show {
         #[arg(long)]
         json: bool,
     },
-    Set {
-        key: String,
-        value: String,
-    },
+    /// Set one configuration key.
+    Set { key: String, value: String },
 }
 
 #[derive(Debug, Subcommand)]
 enum SourceCommand {
-    Add {
-        directory: PathBuf,
-    },
+    /// Register a source directory.
+    Add { directory: PathBuf },
+    /// List registered source directories.
     List {
         #[arg(long)]
         json: bool,
     },
-    Remove {
-        directory: PathBuf,
-    },
+    /// Unregister a source directory.
+    Remove { directory: PathBuf },
 }
 
 #[derive(Debug, Subcommand)]
 enum ModelCommand {
+    /// Download and verify the pinned CLIP model.
     Install {
         #[arg(long)]
         yes: bool,
     },
+    /// Inspect the pinned model installation.
     Status {
         #[arg(long)]
         verify: bool,
         #[arg(long)]
         json: bool,
     },
+    /// Remove the pinned model files.
     Remove,
 }
 
 #[derive(Debug, Subcommand)]
 enum LabelCommand {
+    /// List label packs.
     List {
         #[arg(long)]
         json: bool,
     },
+    /// Create or update a label pack.
     Set {
         name: String,
         #[arg(long, default_value = "custom")]
@@ -161,9 +201,9 @@ enum LabelCommand {
         #[arg(long = "label", value_name = "NAME[=PROMPT]", required = true)]
         labels: Vec<String>,
     },
-    Delete {
-        name: String,
-    },
+    /// Delete a custom label pack.
+    Delete { name: String },
+    /// Rescore saved embeddings with one or all label packs.
     Rescore {
         name: Option<String>,
         #[arg(long)]
@@ -238,32 +278,36 @@ enum BrightnessArg {
 
 #[derive(Debug, Subcommand)]
 enum CollectionCommand {
+    /// Save a filter as a named collection.
     Save {
         name: String,
         #[command(flatten)]
         filter: Box<FilterArgs>,
     },
+    /// List saved collections.
     List {
         #[arg(long)]
         json: bool,
     },
+    /// Show one saved collection's filter.
     Show {
         name: String,
         #[arg(long)]
         json: bool,
     },
-    Delete {
-        name: String,
-    },
+    /// Delete a saved collection.
+    Delete { name: String },
 }
 
 #[derive(Debug, Subcommand)]
 enum TagCommand {
+    /// Add a tag to one or more images.
     Add {
         tag: String,
         #[arg(required = true)]
         image_ids: Vec<i64>,
     },
+    /// Remove a tag from one or more images.
     Remove {
         tag: String,
         #[arg(required = true)]
@@ -273,10 +317,12 @@ enum TagCommand {
 
 #[derive(Debug, Subcommand)]
 enum FavoriteCommand {
+    /// Mark one or more images as favorites.
     Set {
         #[arg(required = true)]
         image_ids: Vec<i64>,
     },
+    /// Remove one or more images from favorites.
     Unset {
         #[arg(required = true)]
         image_ids: Vec<i64>,
@@ -303,6 +349,7 @@ struct MoveArgs {
 
 #[derive(Debug, Subcommand)]
 enum MoveAction {
+    /// Undo a previously applied move.
     Undo {
         id: Uuid,
         #[arg(long)]
@@ -312,20 +359,391 @@ enum MoveAction {
 
 #[derive(Debug, Subcommand)]
 enum WpaperdCommand {
-    Bind {
-        display: String,
-        collection: String,
-    },
-    Refresh {
-        display: Option<String>,
-    },
+    /// Bind a display to a saved collection.
+    Bind { display: String, collection: String },
+    /// Refresh one or all managed wallpaper pools.
+    Refresh { display: Option<String> },
+    /// Show active wpaperd bindings.
     Status {
         #[arg(long)]
         json: bool,
     },
-    Unbind {
-        display: String,
-    },
+    /// Remove a display binding.
+    Unbind { display: String },
+}
+
+pub(crate) fn command_completion_context(input: &str, cursor: usize) -> CommandCompletionContext {
+    let cursor = cursor.min(input.chars().count());
+    let prefix_text = input.chars().take(cursor).collect::<String>();
+    let mut prefix_line =
+        lex_command_line(&prefix_text, false).expect("incomplete command-line lexing cannot fail");
+    let active = prefix_line.has_active_token.then(|| {
+        prefix_line
+            .tokens
+            .pop()
+            .expect("an active command token is present")
+    });
+    let mut completed = prefix_line
+        .tokens
+        .into_iter()
+        .map(|token| token.value)
+        .collect::<Vec<_>>();
+    if completed.first().is_some_and(|word| word == "bgm") {
+        completed.remove(0);
+    }
+
+    let (prefix, replace_start) = active.as_ref().map_or_else(
+        || (String::new(), cursor),
+        |token| (token.value.clone(), token.start),
+    );
+    let replace_end = active.map_or(cursor, |active| {
+        lex_command_line(input, false)
+            .expect("incomplete command-line lexing cannot fail")
+            .tokens
+            .into_iter()
+            .find(|token| token.start == active.start && token.end >= cursor)
+            .map_or(cursor, |token| token.end)
+    });
+    CommandCompletionContext {
+        completed,
+        prefix,
+        replace_start,
+        replace_end,
+    }
+}
+
+pub(crate) fn command_suggestions(input: &str, cursor: usize) -> Vec<CommandSuggestion> {
+    let context = command_completion_context(input, cursor);
+    let mut root = Cli::command();
+    root.build();
+    let mut command = &root;
+    for word in &context.completed {
+        if let Some(subcommand) = command
+            .get_subcommands()
+            .find(|subcommand| subcommand.get_name() == word)
+        {
+            command = subcommand;
+        }
+    }
+
+    let mut suggestions = Vec::new();
+    if let Some((option, value_prefix)) = context.prefix.split_once('=')
+        && let Some(argument) = find_argument(command, option)
+    {
+        for value in argument.get_possible_values() {
+            let name = value.get_name();
+            push_suggestion(
+                &mut suggestions,
+                &context,
+                format!("{option}={name}"),
+                format!("{option}={name}"),
+                value
+                    .get_help()
+                    .map_or_else(String::new, ToString::to_string),
+                value_prefix,
+                true,
+            );
+        }
+        sort_suggestions(&mut suggestions, &context.prefix);
+        return suggestions;
+    }
+
+    if let Some(previous) = context.completed.last()
+        && let Some(argument) = find_argument(command, previous)
+    {
+        let possible_values = argument.get_possible_values();
+        if !possible_values.is_empty() {
+            for value in possible_values {
+                let name = value.get_name();
+                push_suggestion(
+                    &mut suggestions,
+                    &context,
+                    name.to_owned(),
+                    name.to_owned(),
+                    value
+                        .get_help()
+                        .map_or_else(String::new, ToString::to_string),
+                    &context.prefix,
+                    true,
+                );
+            }
+            sort_suggestions(&mut suggestions, &context.prefix);
+            return suggestions;
+        }
+        if argument.get_action().takes_values() {
+            return suggestions;
+        }
+    }
+
+    for subcommand in command.get_subcommands() {
+        if subcommand.get_name() == "help"
+            || (command.get_name() == "bgm" && subcommand.get_name() == "tui")
+        {
+            continue;
+        }
+        let name = subcommand.get_name();
+        push_suggestion(
+            &mut suggestions,
+            &context,
+            name.to_owned(),
+            name.to_owned(),
+            subcommand
+                .get_about()
+                .map_or_else(String::new, ToString::to_string),
+            &context.prefix,
+            true,
+        );
+    }
+    for argument in command.get_arguments() {
+        let description = argument
+            .get_help()
+            .map_or_else(String::new, ToString::to_string);
+        if let Some(long) = argument.get_long() {
+            let option = format!("--{long}");
+            push_suggestion(
+                &mut suggestions,
+                &context,
+                option.clone(),
+                option,
+                description.clone(),
+                &context.prefix,
+                true,
+            );
+        } else if let Some(short) = argument.get_short() {
+            let option = format!("-{short}");
+            push_suggestion(
+                &mut suggestions,
+                &context,
+                option.clone(),
+                option,
+                description.clone(),
+                &context.prefix,
+                true,
+            );
+        }
+    }
+    push_suggestion(
+        &mut suggestions,
+        &context,
+        "--help".into(),
+        "--help".into(),
+        "Print help for this command".into(),
+        &context.prefix,
+        true,
+    );
+    if command.get_name() == "bgm" {
+        push_suggestion(
+            &mut suggestions,
+            &context,
+            "--version".into(),
+            "--version".into(),
+            "Print the bgm version".into(),
+            &context.prefix,
+            true,
+        );
+    }
+    sort_suggestions(&mut suggestions, &context.prefix);
+    suggestions.dedup_by(|left, right| left.replacement == right.replacement);
+    suggestions
+}
+
+pub(crate) fn command_value_suggestion(
+    context: &CommandCompletionContext,
+    value: &str,
+    description: impl Into<String>,
+) -> Option<CommandSuggestion> {
+    if !matches_prefix(value, &context.prefix) {
+        return None;
+    }
+    Some(CommandSuggestion {
+        label: value.to_owned(),
+        replacement: quote_command_argument(value),
+        description: description.into(),
+        replace_start: context.replace_start,
+        replace_end: context.replace_end,
+        append_space: true,
+    })
+}
+
+pub(crate) fn parse_tui_command_line(input: &str) -> Result<Vec<String>> {
+    let mut arguments = lex_command_line(input, true)?
+        .tokens
+        .into_iter()
+        .map(|token| token.value)
+        .collect::<Vec<_>>();
+    if arguments.first().is_some_and(|word| word == "bgm") {
+        arguments.remove(0);
+    }
+    if arguments.is_empty() {
+        bail!("type a bgm command, for example `doctor` or `search --favorite`");
+    }
+
+    let parsed =
+        Cli::try_parse_from(std::iter::once("bgm").chain(arguments.iter().map(String::as_str)));
+    match parsed {
+        Ok(Cli {
+            command: None | Some(Command::Tui),
+        }) => bail!("the command palette is already inside the TUI; choose another command"),
+        Ok(_) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) => {}
+        Err(error) => bail!("{}", error.to_string().trim()),
+    }
+
+    Ok(arguments
+        .into_iter()
+        .map(|value| expand_tilde(&value))
+        .collect())
+}
+
+fn find_argument<'a>(command: &'a clap::Command, option: &str) -> Option<&'a clap::Arg> {
+    command.get_arguments().find(|argument| {
+        argument
+            .get_long()
+            .is_some_and(|long| option == format!("--{long}"))
+            || argument
+                .get_short()
+                .is_some_and(|short| option == format!("-{short}"))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_suggestion(
+    suggestions: &mut Vec<CommandSuggestion>,
+    context: &CommandCompletionContext,
+    label: String,
+    replacement: String,
+    description: String,
+    prefix: &str,
+    append_space: bool,
+) {
+    if matches_prefix(&label, prefix) {
+        suggestions.push(CommandSuggestion {
+            label,
+            replacement,
+            description,
+            replace_start: context.replace_start,
+            replace_end: context.replace_end,
+            append_space,
+        });
+    }
+}
+
+fn sort_suggestions(suggestions: &mut [CommandSuggestion], prefix: &str) {
+    suggestions.sort_by_key(|suggestion| {
+        let label = suggestion.label.to_ascii_lowercase();
+        let prefix = prefix.to_ascii_lowercase();
+        let rank = if label.starts_with(&prefix) { 0 } else { 1 };
+        let option_rank = u8::from(label.starts_with('-'));
+        (rank, option_rank, label)
+    });
+}
+
+fn matches_prefix(value: &str, prefix: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    let prefix = prefix.to_ascii_lowercase();
+    value.starts_with(&prefix) || (!prefix.is_empty() && value.contains(&prefix))
+}
+
+fn quote_command_argument(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-._/:@%+=,".contains(character))
+    {
+        return value.to_owned();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn expand_tilde(value: &str) -> String {
+    let (option, raw_value) = value
+        .split_once('=')
+        .map_or((None, value), |(option, value)| (Some(option), value));
+    let Some(rest) = raw_value.strip_prefix('~') else {
+        return value.to_owned();
+    };
+    if !rest.is_empty() && !rest.starts_with('/') {
+        return value.to_owned();
+    }
+    let Ok(user_home) = std::env::var("HOME") else {
+        return value.to_owned();
+    };
+    let expanded = format!("{user_home}{rest}");
+    option.map_or(expanded.clone(), |option| format!("{option}={expanded}"))
+}
+
+fn lex_command_line(input: &str, strict: bool) -> Result<LexedCommandLine> {
+    let mut tokens = Vec::new();
+    let mut value = String::new();
+    let mut token_start = None;
+    let mut quote = None;
+    let mut escaped = false;
+    let character_count = input.chars().count();
+
+    for (index, character) in input.chars().enumerate() {
+        if escaped {
+            value.push(character);
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some(Quote::Single) if character == '\'' => quote = None,
+            Some(Quote::Single) => value.push(character),
+            Some(Quote::Double) if character == '"' => quote = None,
+            Some(Quote::Double) if character == '\\' => escaped = true,
+            Some(Quote::Double) => value.push(character),
+            None if character.is_whitespace() => {
+                if let Some(start) = token_start.take() {
+                    tokens.push(CommandToken {
+                        value: std::mem::take(&mut value),
+                        start,
+                        end: index,
+                    });
+                }
+            }
+            None if character == '\'' => {
+                token_start.get_or_insert(index);
+                quote = Some(Quote::Single);
+            }
+            None if character == '"' => {
+                token_start.get_or_insert(index);
+                quote = Some(Quote::Double);
+            }
+            None if character == '\\' => {
+                token_start.get_or_insert(index);
+                escaped = true;
+            }
+            None => {
+                token_start.get_or_insert(index);
+                value.push(character);
+            }
+        }
+    }
+
+    if strict {
+        if escaped {
+            bail!("command ends with an unfinished escape");
+        }
+        if quote.is_some() {
+            bail!("command contains an unclosed quote");
+        }
+    }
+    let has_active_token = token_start.is_some();
+    if let Some(start) = token_start {
+        tokens.push(CommandToken {
+            value,
+            start,
+            end: character_count,
+        });
+    }
+    Ok(LexedCommandLine {
+        tokens,
+        has_active_token,
+    })
 }
 
 struct AppContext {
@@ -977,7 +1395,6 @@ mod tests {
 
     #[test]
     fn cli_exposes_required_command_tree() {
-        use clap::CommandFactory as _;
         let command = Cli::command();
         let names: Vec<_> = command
             .get_subcommands()
@@ -1000,5 +1417,68 @@ mod tests {
         ] {
             assert!(names.contains(&required), "missing {required}");
         }
+    }
+
+    #[test]
+    fn tui_command_line_supports_quotes_and_an_optional_binary_name() {
+        let arguments =
+            parse_tui_command_line("bgm search --semantic 'misty mountains at night' --favorite")
+                .expect("valid command");
+
+        assert_eq!(
+            arguments,
+            [
+                "search",
+                "--semantic",
+                "misty mountains at night",
+                "--favorite"
+            ]
+        );
+    }
+
+    #[test]
+    fn tui_command_line_rejects_nested_tuis_and_invalid_syntax() {
+        assert!(
+            parse_tui_command_line("tui")
+                .expect_err("nested TUI should fail")
+                .to_string()
+                .contains("already inside the TUI")
+        );
+        assert!(parse_tui_command_line("search --semantic 'unfinished").is_err());
+        assert!(parse_tui_command_line("doctor; rm -rf /tmp/example").is_err());
+    }
+
+    #[test]
+    fn command_completion_tracks_clap_subcommands_options_and_values() {
+        let root = command_suggestions("col", 3);
+        assert_eq!(
+            root.iter()
+                .map(|suggestion| suggestion.label.as_str())
+                .collect::<Vec<_>>(),
+            ["collection"]
+        );
+        assert!(
+            command_suggestions("collection ", 11)
+                .iter()
+                .any(|suggestion| suggestion.label == "save")
+        );
+        let orientation = "search --orientation ";
+        let values = command_suggestions(orientation, orientation.chars().count());
+        for expected in ["landscape", "portrait", "square"] {
+            assert!(
+                values.iter().any(|suggestion| suggestion.label == expected),
+                "missing {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn completion_context_replaces_the_active_token_only() {
+        let input = "collection sh --json";
+        let context = command_completion_context(input, "collection sh".chars().count());
+
+        assert_eq!(context.completed, ["collection"]);
+        assert_eq!(context.prefix, "sh");
+        assert_eq!((context.replace_start, context.replace_end), (11, 13));
     }
 }

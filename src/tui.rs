@@ -1,6 +1,6 @@
 use std::{
     path::PathBuf,
-    process::Command,
+    process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -30,6 +30,10 @@ use unicode_width::UnicodeWidthChar;
 use crate::{
     AppPaths,
     analysis::{LightDark, Orientation},
+    cli::{
+        CommandCompletionContext, CommandSuggestion, command_completion_context,
+        command_suggestions, command_value_suggestion, parse_tui_command_line,
+    },
     collection::{
         SavedCollection, add_tag, delete_collection, get_collection, list_collections,
         save_collection, search_resolved, set_favorite,
@@ -55,8 +59,32 @@ enum Mode {
     Browse,
     FilterEditor(FilterEditor),
     Input { action: InputAction, value: String },
+    CommandPalette(CommandPalette),
+    CommandOutput(CommandOutput),
     ConfirmMove(MovePlan),
     Help,
+}
+
+struct CommandPalette {
+    value: String,
+    cursor: usize,
+    suggestions: Vec<CommandSuggestion>,
+    selected_suggestion: usize,
+    error: Option<String>,
+    running: bool,
+    history_index: Option<usize>,
+    history_draft: String,
+    selected_image_id: Option<i64>,
+    selected_tags: Vec<String>,
+}
+
+struct CommandOutput {
+    command: String,
+    success: bool,
+    stdout: String,
+    stderr: String,
+    scroll: usize,
+    viewport_height: usize,
 }
 
 enum FilterEditorCommand {
@@ -587,11 +615,425 @@ fn visible_text(value: &str, start: usize, max_width: usize) -> String {
         .collect()
 }
 
+enum CommandPaletteAction {
+    Continue,
+    Cancel,
+    Submit(String),
+}
+
+impl CommandPalette {
+    fn new(database: &Database, selected: Option<&ImageRecord>) -> Self {
+        let mut palette = Self {
+            value: String::new(),
+            cursor: 0,
+            suggestions: Vec::new(),
+            selected_suggestion: 0,
+            error: None,
+            running: false,
+            history_index: None,
+            history_draft: String::new(),
+            selected_image_id: selected.map(|image| image.id),
+            selected_tags: selected.map_or_else(Vec::new, |image| image.tags.clone()),
+        };
+        palette.refresh_suggestions(database);
+        palette
+    }
+
+    fn handle_key(
+        &mut self,
+        key: KeyEvent,
+        history: &[String],
+        database: &Database,
+    ) -> CommandPaletteAction {
+        if self.running {
+            return if key.code == KeyCode::Esc {
+                CommandPaletteAction::Cancel
+            } else {
+                CommandPaletteAction::Continue
+            };
+        }
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => CommandPaletteAction::Cancel,
+            KeyCode::Enter => CommandPaletteAction::Submit(self.value.clone()),
+            KeyCode::Tab => {
+                self.accept_suggestion(database);
+                CommandPaletteAction::Continue
+            }
+            KeyCode::BackTab => {
+                if !self.suggestions.is_empty() {
+                    self.selected_suggestion = self
+                        .selected_suggestion
+                        .checked_sub(1)
+                        .unwrap_or(self.suggestions.len() - 1);
+                }
+                CommandPaletteAction::Continue
+            }
+            KeyCode::Up if !control => {
+                if !self.suggestions.is_empty() {
+                    self.selected_suggestion = self
+                        .selected_suggestion
+                        .checked_sub(1)
+                        .unwrap_or(self.suggestions.len() - 1);
+                }
+                CommandPaletteAction::Continue
+            }
+            KeyCode::Down if !control => {
+                if !self.suggestions.is_empty() {
+                    self.selected_suggestion =
+                        (self.selected_suggestion + 1) % self.suggestions.len();
+                }
+                CommandPaletteAction::Continue
+            }
+            KeyCode::Char('p' | 'P') if control => {
+                self.previous_history(history, database);
+                CommandPaletteAction::Continue
+            }
+            KeyCode::Char('n' | 'N') if control => {
+                self.next_history(history, database);
+                CommandPaletteAction::Continue
+            }
+            KeyCode::Home => {
+                self.cursor = 0;
+                self.refresh_suggestions(database);
+                CommandPaletteAction::Continue
+            }
+            KeyCode::Char('a' | 'A') if control => {
+                self.cursor = 0;
+                self.refresh_suggestions(database);
+                CommandPaletteAction::Continue
+            }
+            KeyCode::End => {
+                self.cursor = self.value.chars().count();
+                self.refresh_suggestions(database);
+                CommandPaletteAction::Continue
+            }
+            KeyCode::Char('e' | 'E') if control => {
+                self.cursor = self.value.chars().count();
+                self.refresh_suggestions(database);
+                CommandPaletteAction::Continue
+            }
+            KeyCode::Char('u' | 'U') if control => {
+                self.replace_chars(0, self.cursor, "");
+                self.cursor = 0;
+                self.edited(database);
+                CommandPaletteAction::Continue
+            }
+            KeyCode::Char('w' | 'W') if control => {
+                let mut start = self.cursor;
+                let characters = self.value.chars().collect::<Vec<_>>();
+                while start > 0 && characters[start - 1].is_whitespace() {
+                    start -= 1;
+                }
+                while start > 0 && !characters[start - 1].is_whitespace() {
+                    start -= 1;
+                }
+                self.replace_chars(start, self.cursor, "");
+                self.cursor = start;
+                self.edited(database);
+                CommandPaletteAction::Continue
+            }
+            KeyCode::Left => {
+                self.cursor = self.cursor.saturating_sub(1);
+                self.refresh_suggestions(database);
+                CommandPaletteAction::Continue
+            }
+            KeyCode::Right => {
+                self.cursor = (self.cursor + 1).min(self.value.chars().count());
+                self.refresh_suggestions(database);
+                CommandPaletteAction::Continue
+            }
+            KeyCode::Backspace => {
+                if self.cursor > 0 {
+                    self.replace_chars(self.cursor - 1, self.cursor, "");
+                    self.cursor -= 1;
+                    self.edited(database);
+                }
+                CommandPaletteAction::Continue
+            }
+            KeyCode::Delete => {
+                if self.cursor < self.value.chars().count() {
+                    self.replace_chars(self.cursor, self.cursor + 1, "");
+                    self.edited(database);
+                }
+                CommandPaletteAction::Continue
+            }
+            KeyCode::Char(character) if !control && !character.is_control() => {
+                let mut text = String::new();
+                text.push(character);
+                self.replace_chars(self.cursor, self.cursor, &text);
+                self.cursor += 1;
+                self.edited(database);
+                CommandPaletteAction::Continue
+            }
+            _ => CommandPaletteAction::Continue,
+        }
+    }
+
+    fn paste(&mut self, value: &str, database: &Database) {
+        if self.running {
+            return;
+        }
+        let value = value
+            .chars()
+            .filter(|character| !matches!(character, '\r' | '\n') && !character.is_control())
+            .collect::<String>();
+        self.replace_chars(self.cursor, self.cursor, &value);
+        self.cursor += value.chars().count();
+        self.edited(database);
+    }
+
+    fn accept_suggestion(&mut self, database: &Database) {
+        let Some(suggestion) = self.suggestions.get(self.selected_suggestion).cloned() else {
+            return;
+        };
+        self.replace_chars(
+            suggestion.replace_start,
+            suggestion.replace_end,
+            &suggestion.replacement,
+        );
+        self.cursor = suggestion.replace_start + suggestion.replacement.chars().count();
+        if suggestion.append_space
+            && self
+                .value
+                .chars()
+                .nth(self.cursor)
+                .is_none_or(|character| !character.is_whitespace())
+        {
+            self.replace_chars(self.cursor, self.cursor, " ");
+            self.cursor += 1;
+        }
+        self.edited(database);
+    }
+
+    fn previous_history(&mut self, history: &[String], database: &Database) {
+        if history.is_empty() {
+            return;
+        }
+        let index = match self.history_index {
+            Some(index) => index.saturating_sub(1),
+            None => {
+                self.history_draft.clone_from(&self.value);
+                history.len() - 1
+            }
+        };
+        self.history_index = Some(index);
+        self.value.clone_from(&history[index]);
+        self.cursor = self.value.chars().count();
+        self.error = None;
+        self.refresh_suggestions(database);
+    }
+
+    fn next_history(&mut self, history: &[String], database: &Database) {
+        let Some(index) = self.history_index else {
+            return;
+        };
+        if index + 1 < history.len() {
+            self.history_index = Some(index + 1);
+            self.value.clone_from(&history[index + 1]);
+        } else {
+            self.history_index = None;
+            self.value.clone_from(&self.history_draft);
+        }
+        self.cursor = self.value.chars().count();
+        self.error = None;
+        self.refresh_suggestions(database);
+    }
+
+    fn edited(&mut self, database: &Database) {
+        self.error = None;
+        self.history_index = None;
+        self.refresh_suggestions(database);
+    }
+
+    fn replace_chars(&mut self, start: usize, end: usize, replacement: &str) {
+        let start = char_to_byte_index(&self.value, start);
+        let end = char_to_byte_index(&self.value, end);
+        self.value.replace_range(start..end, replacement);
+    }
+
+    fn refresh_suggestions(&mut self, database: &Database) {
+        self.suggestions = palette_suggestions(
+            &self.value,
+            self.cursor,
+            database,
+            self.selected_image_id,
+            &self.selected_tags,
+        );
+        self.selected_suggestion = self
+            .selected_suggestion
+            .min(self.suggestions.len().saturating_sub(1));
+    }
+}
+
+impl CommandOutput {
+    fn line_count(&self) -> usize {
+        let mut lines = self.stdout.lines().count();
+        if !self.stderr.is_empty() {
+            lines += self.stderr.lines().count() + 1;
+            lines += usize::from(!self.stdout.is_empty());
+        }
+        lines.max(1)
+    }
+
+    fn max_scroll(&self) -> usize {
+        self.line_count()
+            .saturating_sub(self.viewport_height.max(1))
+    }
+
+    fn move_scroll(&mut self, amount: isize) {
+        self.scroll = self
+            .scroll
+            .saturating_add_signed(amount)
+            .min(self.max_scroll());
+    }
+}
+
+fn palette_suggestions(
+    input: &str,
+    cursor: usize,
+    database: &Database,
+    selected_image_id: Option<i64>,
+    selected_tags: &[String],
+) -> Vec<CommandSuggestion> {
+    let mut suggestions = command_suggestions(input, cursor);
+    let context = command_completion_context(input, cursor);
+    add_contextual_suggestions(
+        &mut suggestions,
+        &context,
+        database,
+        selected_image_id,
+        selected_tags,
+    );
+    suggestions.sort_by_key(|suggestion| {
+        (
+            u8::from(suggestion.label.starts_with('-')),
+            suggestion.label.to_ascii_lowercase(),
+        )
+    });
+    suggestions.dedup_by(|left, right| left.replacement == right.replacement);
+    suggestions
+}
+
+fn add_contextual_suggestions(
+    suggestions: &mut Vec<CommandSuggestion>,
+    context: &CommandCompletionContext,
+    database: &Database,
+    selected_image_id: Option<i64>,
+    selected_tags: &[String],
+) {
+    const CONFIG_KEYS: &[&str] = &[
+        "ai.enabled",
+        "analysis.common_ratio_tolerance",
+        "analysis.dark_threshold",
+        "analysis.palette_colors",
+        "analysis.thumbnail_long_edge",
+        "import.max_height",
+        "import.max_width",
+        "import.min_height",
+        "import.min_width",
+    ];
+    const DISPLAYS: &[&str] = &["any", "DP-1", "DP-2", "HDMI-A-1"];
+
+    let words = context
+        .completed
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let mut add = |value: &str, description: &str| {
+        if let Some(suggestion) = command_value_suggestion(context, value, description) {
+            suggestions.push(suggestion);
+        }
+    };
+    match words.as_slice() {
+        ["config", "set"] => {
+            for key in CONFIG_KEYS {
+                add(key, "configuration key");
+            }
+        }
+        ["config", "set", "ai.enabled"] => {
+            add("true", "enable local AI analysis");
+            add("false", "disable local AI analysis");
+        }
+        ["source", "remove"] => {
+            if let Ok(sources) = database.list_sources() {
+                for source in sources {
+                    add(
+                        &source.path.to_string_lossy(),
+                        "registered source directory",
+                    );
+                }
+            }
+        }
+        ["collection", "show" | "delete"] | ["wpaperd", "bind", _] => {
+            if let Ok(collections) = list_collections(database) {
+                for collection in collections {
+                    add(&collection.name, "saved collection");
+                }
+            }
+        }
+        ["wpaperd", "bind"] | ["wpaperd", "refresh"] => {
+            for display in DISPLAYS {
+                add(display, "wpaperd display");
+            }
+        }
+        ["wpaperd", "unbind"] => {
+            if let Ok(bindings) = wpaperd::list_bindings(database) {
+                for binding in bindings {
+                    add(&binding.display, "active wpaperd binding");
+                }
+            }
+        }
+        ["label", "delete" | "rescore"] => {
+            if let Ok(packs) = model::list_label_packs(database) {
+                for pack in packs {
+                    add(&pack.name, "saved label pack");
+                }
+            }
+        }
+        ["search", "--tag"] | ["collection", "save", _, "--tag"] => {
+            if let Ok(tags) = catalog_tags(database) {
+                for tag in tags {
+                    add(&tag, "catalog tag");
+                }
+            }
+        }
+        ["tag", "remove"] => {
+            for tag in selected_tags {
+                add(tag, "tag on the selected image");
+            }
+        }
+        ["tag", "add" | "remove", _] | ["favorite", "set" | "unset"] | [.., "--image-id"] => {
+            if let Some(id) = selected_image_id {
+                add(&id.to_string(), "selected image ID");
+            }
+        }
+        _ => {}
+    }
+}
+
+fn catalog_tags(database: &Database) -> Result<Vec<String>> {
+    database.with_connection(|connection| {
+        let mut statement = connection.prepare("SELECT name FROM tags ORDER BY name")?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    })
+}
+
 enum BackgroundResult {
     Progress(ScanEvent),
     Finished {
         scan: ScanReport,
         ai: Option<model::AiReport>,
+    },
+    Failed(String),
+}
+
+enum CommandBackgroundResult {
+    Finished {
+        success: bool,
+        stdout: String,
+        stderr: String,
     },
     Failed(String),
 }
@@ -608,6 +1050,11 @@ struct App {
     scan_receiver: Option<Receiver<BackgroundResult>>,
     scan_started: Option<Instant>,
     scan_total: Option<usize>,
+    command_receiver: Option<Receiver<CommandBackgroundResult>>,
+    command_started: Option<Instant>,
+    running_command: Option<String>,
+    command_history: Vec<String>,
+    pending_command_output: Option<CommandOutput>,
     should_quit: bool,
 }
 
@@ -637,6 +1084,11 @@ impl App {
             scan_receiver: None,
             scan_started: None,
             scan_total: None,
+            command_receiver: None,
+            command_started: None,
+            running_command: None,
+            command_history: Vec::new(),
+            pending_command_output: None,
             should_quit: false,
         };
         app.load_preview();
@@ -825,10 +1277,157 @@ impl App {
         }
         Ok(())
     }
+
+    fn start_command(&mut self, display: String, arguments: Vec<String>) -> Result<()> {
+        if self.scan_receiver.is_some() {
+            anyhow::bail!("wait for the background scan to finish before running a command");
+        }
+        if self.command_receiver.is_some() {
+            anyhow::bail!("another command is already running");
+        }
+        let executable = std::env::current_exe().context("failed to locate the bgm executable")?;
+        let (sender, receiver) = unbounded();
+        thread::spawn(move || {
+            let result = Command::new(executable)
+                .args(arguments)
+                .env("NO_COLOR", "1")
+                .stdin(Stdio::null())
+                .output()
+                .map(|output| CommandBackgroundResult::Finished {
+                    success: output.status.success(),
+                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                })
+                .unwrap_or_else(|error| CommandBackgroundResult::Failed(format!("{error:#}")));
+            let _ = sender.send(result);
+        });
+        if self.command_history.last() != Some(&display) {
+            self.command_history.push(display.clone());
+            if self.command_history.len() > 100 {
+                self.command_history.remove(0);
+            }
+        }
+        self.command_receiver = Some(receiver);
+        self.command_started = Some(Instant::now());
+        self.running_command = Some(display.clone());
+        if let Mode::CommandPalette(palette) = &mut self.mode {
+            palette.running = true;
+            palette.error = None;
+        }
+        self.status = format!("Running `{display}`…");
+        Ok(())
+    }
+
+    fn poll_command(&mut self, database: &Database, paths: &AppPaths, config: &mut Config) {
+        let Some(receiver) = self.command_receiver.clone() else {
+            if matches!(self.mode, Mode::Browse)
+                && let Some(output) = self.pending_command_output.take()
+            {
+                self.mode = Mode::CommandOutput(output);
+            }
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(CommandBackgroundResult::Finished {
+                success,
+                stdout,
+                mut stderr,
+            }) => {
+                let command = self.running_command.take().unwrap_or_default();
+                self.command_receiver = None;
+                let elapsed = self
+                    .command_started
+                    .take()
+                    .map_or(0.0, |started| started.elapsed().as_secs_f32());
+                if let Err(error) = self.reload(database, paths) {
+                    append_command_note(
+                        &mut stderr,
+                        &format!("TUI refresh failed after the command: {error:#}"),
+                    );
+                }
+                match Config::load(&paths.config_file) {
+                    Ok(updated) => *config = updated,
+                    Err(error) => append_command_note(
+                        &mut stderr,
+                        &format!("Configuration reload failed: {error:#}"),
+                    ),
+                }
+                self.status = format!(
+                    "Command {} in {elapsed:.1}s: {command}",
+                    if success { "finished" } else { "failed" }
+                );
+                self.present_command_output(CommandOutput {
+                    command,
+                    success,
+                    stdout,
+                    stderr,
+                    scroll: 0,
+                    viewport_height: 1,
+                });
+            }
+            Ok(CommandBackgroundResult::Failed(error)) => {
+                let command = self.running_command.take().unwrap_or_default();
+                self.command_receiver = None;
+                self.command_started = None;
+                self.status = format!("Command failed to start: {command}");
+                self.present_command_output(CommandOutput {
+                    command,
+                    success: false,
+                    stdout: String::new(),
+                    stderr: error,
+                    scroll: 0,
+                    viewport_height: 1,
+                });
+            }
+            Err(TryRecvError::Empty) => {
+                if let (Some(command), Some(started)) =
+                    (self.running_command.as_deref(), self.command_started)
+                {
+                    self.status = format!(
+                        "Running `{command}`… {:.1}s",
+                        started.elapsed().as_secs_f32()
+                    );
+                }
+            }
+            Err(TryRecvError::Disconnected) => {
+                let command = self.running_command.take().unwrap_or_default();
+                self.command_receiver = None;
+                self.command_started = None;
+                self.status = format!("Command worker stopped unexpectedly: {command}");
+                self.present_command_output(CommandOutput {
+                    command,
+                    success: false,
+                    stdout: String::new(),
+                    stderr: "the background command worker disconnected without a result".into(),
+                    scroll: 0,
+                    viewport_height: 1,
+                });
+            }
+        }
+    }
+
+    fn present_command_output(&mut self, output: CommandOutput) {
+        if matches!(self.mode, Mode::Browse | Mode::CommandPalette(_)) {
+            self.mode = Mode::CommandOutput(output);
+        } else {
+            self.pending_command_output = Some(output);
+            self.status
+                .push_str(" — output will open after the current dialog");
+        }
+    }
+}
+
+fn append_command_note(output: &mut String, note: &str) {
+    if !output.is_empty() && !output.ends_with('\n') {
+        output.push('\n');
+    }
+    output.push_str(note);
+    output.push('\n');
 }
 
 pub fn run(database: &Database, paths: &AppPaths, config: &Config) -> Result<()> {
     let mut app = App::new(database, paths)?;
+    let mut config = config.clone();
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     if let Err(error) = execute!(
@@ -852,7 +1451,7 @@ pub fn run(database: &Database, paths: &AppPaths, config: &Config) -> Result<()>
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    let result = run_loop(&mut terminal, &mut app, database, paths, config);
+    let result = run_loop(&mut terminal, &mut app, database, paths, &mut config);
 
     drop(terminal);
     drop(cleanup);
@@ -879,12 +1478,13 @@ fn run_loop(
     app: &mut App,
     database: &Database,
     paths: &AppPaths,
-    config: &Config,
+    config: &mut Config,
 ) -> Result<()> {
     while !app.should_quit {
         if let Err(error) = app.poll_scan(database, paths) {
             app.status = format!("Background result error: {error:#}");
         }
+        app.poll_command(database, paths, config);
         terminal.draw(|frame| draw(frame, app))?;
         if event::poll(Duration::from_millis(100))? {
             let result = match event::read()? {
@@ -892,7 +1492,7 @@ fn run_loop(
                     handle_key(app, key, database, paths, config)
                 }
                 Event::Paste(value) => {
-                    handle_paste(app, &value);
+                    handle_paste(app, &value, database);
                     Ok(())
                 }
                 _ => Ok(()),
@@ -916,9 +1516,33 @@ fn handle_key(
     if matches!(&app.mode, Mode::FilterEditor(_)) {
         return handle_filter_editor_key(app, key, database, paths);
     }
+    if matches!(&app.mode, Mode::CommandPalette(_)) {
+        return handle_command_palette_key(app, key, database);
+    }
     match &mut app.mode {
         Mode::Browse => handle_browse_key(app, key, database, paths, config),
         Mode::FilterEditor(_) => unreachable!("filter editor handled above"),
+        Mode::CommandPalette(_) => unreachable!("command palette handled above"),
+        Mode::CommandOutput(output) => {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => app.mode = Mode::Browse,
+                KeyCode::Char(':') => open_command_palette(app, database),
+                KeyCode::Up | KeyCode::Char('k') => output.move_scroll(-1),
+                KeyCode::Down | KeyCode::Char('j') => output.move_scroll(1),
+                KeyCode::PageUp => output.move_scroll(
+                    -isize::try_from(output.viewport_height.saturating_sub(1).max(1))
+                        .unwrap_or(isize::MAX),
+                ),
+                KeyCode::PageDown => output.move_scroll(
+                    isize::try_from(output.viewport_height.saturating_sub(1).max(1))
+                        .unwrap_or(isize::MAX),
+                ),
+                KeyCode::Home | KeyCode::Char('g') => output.scroll = 0,
+                KeyCode::End | KeyCode::Char('G') => output.scroll = output.max_scroll(),
+                _ => {}
+            }
+            Ok(())
+        }
         Mode::Help => {
             app.mode = Mode::Browse;
             Ok(())
@@ -961,6 +1585,43 @@ fn handle_key(
             _ => Ok(()),
         },
     }
+}
+
+fn handle_command_palette_key(app: &mut App, key: KeyEvent, database: &Database) -> Result<()> {
+    let action = match &mut app.mode {
+        Mode::CommandPalette(palette) => palette.handle_key(key, &app.command_history, database),
+        _ => return Ok(()),
+    };
+    match action {
+        CommandPaletteAction::Continue => {}
+        CommandPaletteAction::Cancel => {
+            let running = app.command_receiver.is_some();
+            app.mode = Mode::Browse;
+            if running {
+                app.status =
+                    "Command continues in the background; its output will open when finished"
+                        .into();
+            }
+        }
+        CommandPaletteAction::Submit(value) => {
+            let display = value.trim().to_owned();
+            match parse_tui_command_line(&display) {
+                Ok(arguments) => {
+                    if let Err(error) = app.start_command(display, arguments)
+                        && let Mode::CommandPalette(palette) = &mut app.mode
+                    {
+                        palette.error = Some(format!("{error:#}"));
+                    }
+                }
+                Err(error) => {
+                    if let Mode::CommandPalette(palette) = &mut app.mode {
+                        palette.error = Some(format!("{error:#}"));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn handle_filter_editor_key(
@@ -1040,9 +1701,10 @@ fn handle_filter_editor_key(
     Ok(())
 }
 
-fn handle_paste(app: &mut App, value: &str) {
+fn handle_paste(app: &mut App, value: &str, database: &Database) {
     match &mut app.mode {
         Mode::FilterEditor(editor) => editor.paste(value),
+        Mode::CommandPalette(palette) => palette.paste(value, database),
         Mode::Input {
             value: input_value, ..
         } => input_value.extend(
@@ -1076,6 +1738,13 @@ fn handle_browse_key(
             app.load_preview();
         }
         KeyCode::Char('?') => app.mode = Mode::Help,
+        KeyCode::Char(':') => {
+            if app.command_receiver.is_some() {
+                app.status = "A command is already running in the background".into();
+            } else {
+                open_command_palette(app, database);
+            }
+        }
         KeyCode::Char('/') => {
             app.mode = Mode::FilterEditor(FilterEditor::new(
                 serde_json::to_string_pretty(&app.filter)?,
@@ -1132,6 +1801,11 @@ fn handle_browse_key(
         _ => {}
     }
     Ok(())
+}
+
+fn open_command_palette(app: &mut App, database: &Database) {
+    let palette = CommandPalette::new(database, app.selected());
+    app.mode = Mode::CommandPalette(palette);
 }
 
 fn submit_input(
@@ -1348,7 +2022,7 @@ fn render_base(frame: &mut Frame<'_>, app: &App) -> ScreenAreas {
             Span::styled("↑/↓", Style::default().fg(Color::Cyan)),
             Span::raw(" navigate  "),
             Span::styled("/", Style::default().fg(Color::Cyan)),
-            Span::raw(" filter  f favorite  t tag  c collection  m move  w bind  s scan  o open  ? help  q quit"),
+            Span::raw(" filter  : commands  f favorite  t tag  c collection  m move  w bind  s scan  o open  ? help  q quit"),
         ]))
         .block(Block::default().borders(Borders::TOP)),
         vertical[2],
@@ -1449,12 +2123,14 @@ fn render_modal(frame: &mut Frame<'_>, app: &mut App) {
     match &mut app.mode {
         Mode::Browse => {}
         Mode::FilterEditor(editor) => render_filter_editor(frame, editor),
+        Mode::CommandPalette(palette) => render_command_palette(frame, palette),
+        Mode::CommandOutput(output) => render_command_output(frame, output),
         Mode::Help => {
             let area = centered_rect(76, 86, frame.area());
             frame.render_widget(Clear, area);
             frame.render_widget(
                 Paragraph::new(
-                    "Keyboard\n\n↑/↓, j/k  navigate\n/          filter examples, presets, and JSON\nf          toggle favorite\nt          add a custom tag\nc          save/load/list/delete collections\nm          preview move of selected image\nw          bind or unbind a wpaperd display\ns          background scan and GPU analysis\no, Enter   open with xdg-open\nq          quit\n\nFilter editor\nTab         switch JSON/preset panes\n↑/↓ + Enter select and load a preset\nCtrl+P      save JSON as a named preset\nCtrl+S      apply filter\nCtrl+R      reset every facet\nEsc         cancel\n\nSaved presets are collections and work with the CLI and wpaperd.\n\nPress any key to close.",
+                    "Keyboard\n\n↑/↓, j/k    navigate\n:            run any bgm CLI command\n/            filter examples, presets, and JSON\nf/t/c        favorite, tag, collections\nm/w/s        move, wpaperd binding, background scan\no or Enter   open with xdg-open\nq            quit\n\nCommand palette\nTab / ↑/↓    complete / choose suggestion\nCtrl+P/N     previous / next command in history\n←/→ Home End edit; Ctrl+W deletes a word\nEnter runs in background; Esc closes\n\nFilter editor\nTab / ↑/↓    switch pane / choose preset\nEnter loads preset or inserts a JSON line\nCtrl+P       save JSON as a named preset\nCtrl+S/R     apply / reset filter\nEsc          cancel\n\nPress any key to close.",
                 )
                 .wrap(Wrap { trim: false })
                 .block(Block::default().borders(Borders::ALL).title(" Help ")),
@@ -1523,6 +2199,219 @@ fn render_modal(frame: &mut Frame<'_>, app: &mut App) {
             );
         }
     }
+}
+
+fn render_command_palette(frame: &mut Frame<'_>, palette: &CommandPalette) {
+    let area = centered_rect(88, 62, frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Command palette — bgm commands ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Min(3),
+            Constraint::Length(4),
+        ])
+        .split(inner);
+
+    frame.render_widget(
+        Paragraph::new("Type a command without the leading `bgm` • quotes and ~/ paths work")
+            .style(Style::default().fg(Color::DarkGray)),
+        sections[0],
+    );
+    let input_block = Block::default().borders(Borders::ALL).title(" Command ");
+    let input_inner = input_block.inner(sections[1]);
+    frame.render_widget(input_block, sections[1]);
+    let content_width = usize::from(input_inner.width.saturating_sub(2));
+    let mut scroll = 0;
+    while display_width(&palette.value, scroll, palette.cursor) >= content_width.max(1)
+        && scroll < palette.cursor
+    {
+        scroll += 1;
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("> ", Style::default().fg(Color::Cyan)),
+            Span::raw(visible_text(&palette.value, scroll, content_width)),
+        ])),
+        input_inner,
+    );
+
+    let items = if palette.suggestions.is_empty() {
+        vec![ListItem::new(Span::styled(
+            "No completions — continue typing or press Enter to validate",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        palette
+            .suggestions
+            .iter()
+            .map(|suggestion| {
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{:<24}", suggestion.label),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::raw(suggestion.description.clone()),
+                ]))
+            })
+            .collect()
+    };
+    let mut state = ListState::default()
+        .with_selected((!palette.suggestions.is_empty()).then_some(palette.selected_suggestion));
+    frame.render_stateful_widget(
+        List::new(items)
+            .highlight_symbol("▸ ")
+            .highlight_style(
+                Style::default()
+                    .bg(Color::Rgb(35, 48, 65))
+                    .add_modifier(Modifier::BOLD),
+            )
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" IntelliSense "),
+            ),
+        sections[2],
+        &mut state,
+    );
+
+    let feedback = if palette.running {
+        Span::styled(
+            "Running in the background… Esc hides this box; output opens when ready.",
+            Style::default().fg(Color::Yellow),
+        )
+    } else if let Some(error) = &palette.error {
+        Span::styled(format!("Error: {error}"), Style::default().fg(Color::Red))
+    } else if let Some(suggestion) = palette.suggestions.get(palette.selected_suggestion) {
+        Span::styled(
+            suggestion.description.clone(),
+            Style::default().fg(Color::DarkGray),
+        )
+    } else {
+        Span::raw("")
+    };
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from("Tab completes • ↑/↓ selects • Ctrl+P/N history • Enter runs • Esc closes"),
+            Line::from(
+                "Only bgm commands run; shell operators and $VARIABLE expansion are not used.",
+            ),
+            Line::from(feedback),
+        ])
+        .wrap(Wrap { trim: false }),
+        sections[3],
+    );
+
+    if !palette.running && input_inner.width > 2 {
+        let cursor_x = u16::try_from(display_width(&palette.value, scroll, palette.cursor))
+            .unwrap_or(u16::MAX)
+            .min(input_inner.width.saturating_sub(3));
+        frame.set_cursor_position((input_inner.x + 2 + cursor_x, input_inner.y));
+    }
+}
+
+fn render_command_output(frame: &mut Frame<'_>, output: &mut CommandOutput) {
+    let area = centered_rect(92, 82, frame.area());
+    frame.render_widget(Clear, area);
+    let colour = if output.success {
+        Color::Green
+    } else {
+        Color::Red
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(colour))
+        .title(if output.success {
+            " Command finished "
+        } else {
+            " Command failed "
+        });
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled("bgm ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    output.command.clone(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(if output.success {
+                "exit: success"
+            } else {
+                "exit: failure"
+            }),
+        ]),
+        sections[0],
+    );
+
+    let mut lines = Vec::new();
+    lines.extend(
+        output
+            .stdout
+            .lines()
+            .map(|line| Line::from(line.to_owned())),
+    );
+    if !output.stderr.is_empty() {
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled(
+            "stderr / diagnostics",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.extend(output.stderr.lines().map(|line| {
+            Line::from(Span::styled(
+                line.to_owned(),
+                Style::default().fg(Color::LightRed),
+            ))
+        }));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "(command produced no output)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    output.viewport_height = usize::from(sections[1].height);
+    output.scroll = output.scroll.min(output.max_scroll());
+    frame.render_widget(
+        Paragraph::new(lines)
+            .scroll((u16::try_from(output.scroll).unwrap_or(u16::MAX), 0))
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title(" Output ")),
+        sections[1],
+    );
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(format!(
+                "line {} of {}",
+                output.scroll.saturating_add(1),
+                output.line_count().max(1)
+            )),
+            Line::from("↑/↓ or Page Up/Down scroll • Enter/Esc closes • : runs another command"),
+        ])
+        .style(Style::default().fg(Color::DarkGray)),
+        sections[2],
+    );
 }
 
 fn render_filter_editor(frame: &mut Frame<'_>, editor: &mut FilterEditor) {
@@ -1836,6 +2725,11 @@ mod tests {
             scan_receiver: None,
             scan_started: None,
             scan_total: None,
+            command_receiver: None,
+            command_started: None,
+            running_command: None,
+            command_history: Vec::new(),
+            pending_command_output: None,
             should_quit: false,
         }
     }
@@ -2111,6 +3005,155 @@ mod tests {
         let bottom = buffer_text(&terminal);
         assert!(bottom.contains("\"favorite\": null"));
         assert!(bottom.contains("showing lines"));
+    }
+
+    #[test]
+    fn command_palette_completes_commands_and_clap_subcommands() {
+        let (_directory, _paths, database, _app) = empty_runtime();
+        let image = mock_image();
+        let mut palette = CommandPalette::new(&database, Some(&image));
+
+        for character in "col".chars() {
+            assert!(matches!(
+                palette.handle_key(
+                    KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                    &[],
+                    &database,
+                ),
+                CommandPaletteAction::Continue
+            ));
+        }
+        assert_eq!(palette.suggestions.len(), 1);
+        assert_eq!(palette.suggestions[0].label, "collection");
+        palette.handle_key(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &[],
+            &database,
+        );
+
+        assert_eq!(palette.value, "collection ");
+        assert!(
+            palette
+                .suggestions
+                .iter()
+                .any(|suggestion| suggestion.label == "save")
+        );
+    }
+
+    #[test]
+    fn command_palette_completes_live_collection_names_with_quoting() {
+        let (_directory, _paths, database, _app) = empty_runtime();
+        save_collection(&database, "Night skies", &FilterSpecV1::default())
+            .expect("save collection");
+        let image = mock_image();
+        let mut palette = CommandPalette::new(&database, Some(&image));
+        palette.value = "collection show Ni".into();
+        palette.cursor = palette.value.chars().count();
+        palette.refresh_suggestions(&database);
+        palette.selected_suggestion = palette
+            .suggestions
+            .iter()
+            .position(|suggestion| suggestion.label == "Night skies")
+            .expect("live collection completion");
+
+        palette.accept_suggestion(&database);
+
+        assert_eq!(palette.value, "collection show 'Night skies' ");
+    }
+
+    #[test]
+    fn command_palette_completes_catalog_tags() {
+        let (_directory, _paths, database, _app) = empty_runtime();
+        database
+            .with_connection(|connection| {
+                connection.execute("INSERT INTO tags(name) VALUES ('desktop')", [])?;
+                Ok(())
+            })
+            .expect("insert tag");
+        let mut palette = CommandPalette::new(&database, None);
+        palette.value = "search --tag des".into();
+        palette.cursor = palette.value.chars().count();
+        palette.refresh_suggestions(&database);
+
+        assert!(
+            palette
+                .suggestions
+                .iter()
+                .any(|suggestion| suggestion.label == "desktop")
+        );
+    }
+
+    #[test]
+    fn command_palette_rejects_a_nested_tui_without_closing() {
+        let (_directory, _paths, database, mut app) = empty_runtime();
+        let mut palette = CommandPalette::new(&database, None);
+        palette.value = "tui".into();
+        palette.cursor = 3;
+        palette.refresh_suggestions(&database);
+        app.mode = Mode::CommandPalette(palette);
+
+        handle_command_palette_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &database,
+        )
+        .expect("handle command");
+
+        let Mode::CommandPalette(palette) = &app.mode else {
+            panic!("invalid command closed the palette");
+        };
+        assert!(
+            palette
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("already inside the TUI"))
+        );
+    }
+
+    #[test]
+    fn completed_command_does_not_discard_an_open_dialog() {
+        let (_directory, paths, database, mut app) = empty_runtime();
+        app.mode = Mode::Help;
+        app.present_command_output(CommandOutput {
+            command: "doctor".into(),
+            success: true,
+            stdout: "ok".into(),
+            stderr: String::new(),
+            scroll: 0,
+            viewport_height: 1,
+        });
+
+        assert!(matches!(app.mode, Mode::Help));
+        assert!(app.pending_command_output.is_some());
+
+        app.mode = Mode::Browse;
+        let mut config = Config::default();
+        app.poll_command(&database, &paths, &mut config);
+        assert!(matches!(app.mode, Mode::CommandOutput(_)));
+        assert!(app.pending_command_output.is_none());
+    }
+
+    #[test]
+    fn command_palette_renders_intellisense() {
+        let (_directory, _paths, database, _app) = empty_runtime();
+        let mut palette = CommandPalette::new(&database, Some(&mock_image()));
+        palette.value = "collection ".into();
+        palette.cursor = palette.value.chars().count();
+        palette.refresh_suggestions(&database);
+        let mut app = mock_app(Mode::CommandPalette(palette));
+        let backend = TestBackend::new(110, 32);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| render_modal(frame, &mut app))
+            .expect("draw palette");
+        let screen = buffer_text(&terminal);
+
+        assert!(screen.contains("Command palette"));
+        assert!(screen.contains("IntelliSense"));
+        assert!(screen.contains("save"));
+        assert!(screen.contains("Ctrl+P/N history"));
+        insta::assert_snapshot!("command_palette", screen);
     }
 
     #[test]
