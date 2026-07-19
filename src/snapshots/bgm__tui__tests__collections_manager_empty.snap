@@ -1,0 +1,32 @@
+---
+source: src/tui.rs
+expression: screen
+---
+
+
+   ┌ Collections manager ─────────────────────────────────────────────────────────────────────────────────┐
+   │┌ Saved collections ───────────────┐┌ Details — readable ────────────────────────────────────────────┐│
+   ││       No saved collections       ││No saved collections                                            ││
+   ││                                  ││                                                                ││
+   ││        Press s to save the       ││Press s to save the current browser filter.                     ││
+   ││      current browser filter.     ││The new collection will also be available to the CLI and        ││
+   ││                                  ││wpaperd.                                                        ││
+   ││                                  ││                                                                ││
+   ││                                  ││                                                                ││
+   ││                                  ││                                                                ││
+   ││                                  ││                                                                ││
+   ││                                  ││                                                                ││
+   ││                                  ││                                                                ││
+   ││                                  ││                                                                ││
+   ││                                  ││                                                                ││
+   ││                                  ││                                                                ││
+   ││                                  ││                                                                ││
+   ││                                  ││                                                                ││
+   ││                                  ││                                                                ││
+   ││                                  ││                                                                ││
+   │└──────────────────────────────────┘└────────────────────────────────────────────────────────────────┘│
+   │Enter load • s save new • u update • d delete • v readable/JSON                                       │
+   │Tab or ←/→ switches pane • ↑/↓, Page Up/Down, Home/End navigate                                       │
+   │Esc closes or cancels a prompt first • c closes                                                       │
+   │● current filter • W active wpaperd binding                                                           │
+   └──────────────────────────────────────────────────────────────────────────────────────────────────────┘

@@ -1,0 +1,32 @@
+---
+source: src/tui.rs
+expression: screen
+---
+
+
+   ┌ Collections manager ─────────────────────────────────────────────────────────────────────────────────┐
+   │┌ Saved collections ───────────────┐┌ Details — readable ────────────────────────────────────────────┐│
+   ││      All wallpapers              ││Warm widescreen                                                 ││
+   ││▸ ● W Warm widescreen             ││Created: 2023-11-14 22:13:20 UTC                                ││
+   ││                                  ││Updated: 2023-11-14 23:14:21 UTC                                ││
+   ││                                  ││Current browser filter: exact match                             ││
+   ││                                  ││wpaperd displays: DP-1                                          ││
+   ││                                  ││                                                                ││
+   ││              ┌ Confirm overwrite ───────────────────────────────────────────────────┐              ││
+   ││              │A collection named Warm widescreen already exists. Replace its filter │              ││
+   ││              │with the current browser filter?                                      │              ││
+   ││              │                                                                      │              ││
+   ││              │Enter or y confirms • n or Esc cancels                                │              ││
+   ││              │                                                                      │              ││
+   ││              │                                                                      │e 0.1         ││
+   ││              │                                                                      │              ││
+   ││              └──────────────────────────────────────────────────────────────────────┘              ││
+   ││                                  ││                                                                ││
+   ││                                  ││                                                                ││
+   ││                                  ││                                                                ││
+   │└──────────────────────────────────┘└────────────────────────────────────────────────────────────────┘│
+   │Enter load • s save new • u update • d delete • v readable/JSON                                       │
+   │Tab or ←/→ switches pane • ↑/↓, Page Up/Down, Home/End navigate                                       │
+   │Esc closes or cancels a prompt first • c closes                                                       │
+   │● current filter • W active wpaperd binding                                                           │
+   └──────────────────────────────────────────────────────────────────────────────────────────────────────┘

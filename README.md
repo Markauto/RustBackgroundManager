@@ -125,7 +125,7 @@ Scans, moves, label/tag/favorite changes, and collection updates refresh active 
 - `r`: clear the active filter and show all searchable wallpapers
 - `f`: toggle favorite
 - `t`: add a tag, or enter `remove TAG` to remove one
-- `c`: save, load, list, or delete collections
+- `c`: open the two-pane collections manager
 - `m`: preview and confirm a move for the selected image
 - `w`: bind or unbind a wpaperd display
 - `o` or Enter: open the original with `xdg-open`
@@ -134,6 +134,8 @@ Scans, moves, label/tag/favorite changes, and collection updates refresh active 
 The command palette uses the same Clap command tree as the CLI, so its IntelliSense list follows the current subcommand and suggests flags and enumerated values. It also completes live collection names, registered source paths, label packs, wpaperd displays, catalog tags, and the selected image ID where relevant. Use Up/Down to choose a suggestion, Tab to accept it, Ctrl+P/Ctrl+N for command history, and Enter to validate and run. Commands execute in the background; their stdout and diagnostics open in a scrollable result panel, and the browser refreshes afterward. The optional leading `bgm` is accepted, quotes and `~/` paths work, and nested `tui` launches are refused. The palette invokes `bgm` directly rather than through a shell, so shell operators and environment-variable expansion are intentionally unavailable.
 
 Inside the filter editor, Tab switches between the preset list and pretty-printed JSON. In the preset list, use the arrow keys and Enter to load one of the read-only examples or a saved collection into the editor. Ctrl+P saves the current validated JSON as a named preset; saving an existing name updates it. In the JSON pane, FilterSpecV1 IntelliSense follows the cursor and completes root and nested field names, enum values, booleans, nulls, common numeric values, colour filters, and AI-label templates—even while the document is temporarily invalid. Editing automatically refreshes relevant suggestions; Ctrl+Space opens them explicitly, Up/Down selects, and Tab or Enter accepts. Esc closes suggestions before cancelling the editor. With no suggestions open, Tab changes pane and Enter inserts a line. Ctrl+S validates and applies the filter, while Ctrl+R restores the default filter. Parse or validation errors stay open so they can be corrected. Pasted multiline JSON and preset names are supported.
+
+Inside the collections manager, the left pane lists saved collections and marks exact matches for the current browser filter (`●`) and active wpaperd bindings (`W`). The right pane shows timestamps, bound displays, match status, and every active filter facet; press `v` to toggle pretty-printed `FilterSpecV1` JSON. Tab or Left/Right switches panes. Up/Down, `j`/`k`, Page Up/Down, and Home/End select collections or scroll details. Enter loads the selected collection. Press `s` to save the current filter under a new name, `u` to update the selected collection, or `d` to delete it after confirmation. Names support cursor editing and paste. Bound collections cannot be deleted until their listed displays are unbound. Esc cancels an open prompt before closing the manager; `c` also closes it when no prompt is active.
 
 Kitty graphics are selected when available. Other terminals use ratatui-image half-block rendering, and `xdg-open` remains available as a fallback.
 
@@ -167,4 +169,4 @@ BGM_CLIP_MODEL_DIR=/path/to/verified/model \
   cargo test --features rocm rocm_clip_has_stable_embedding_dimensions_and_ranking -- --ignored
 ```
 
-The test suite uses temporary XDG roots for catalog, move, and wpaperd workflows. It includes command-level JSON tests, byte-identical move undo, corrupt/missing and overlapping-root scans, executable SQL filter composition, TOML preservation, rebinding safety, and a Ratatui screen snapshot.
+The test suite uses temporary XDG roots for catalog, move, and wpaperd workflows. It includes command-level JSON tests, byte-identical move undo, corrupt/missing and overlapping-root scans, executable SQL filter composition, TOML preservation, rebinding safety, and Ratatui screen snapshots.

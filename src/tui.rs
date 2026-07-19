@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 use crossterm::{
     cursor::Show,
@@ -34,8 +35,8 @@ use crate::{
         command_suggestions, command_value_suggestion, parse_tui_command_line,
     },
     collection::{
-        SavedCollection, add_tag, delete_collection, get_collection, list_collections, remove_tag,
-        save_collection, search_resolved, set_favorite,
+        SavedCollection, add_tag, delete_collection, list_collections, remove_tag, save_collection,
+        search_resolved, set_favorite,
     },
     config::Config,
     db::{CatalogSummary, Database, ImageRecord},
@@ -51,7 +52,6 @@ use crate::{
 enum InputAction {
     Source,
     Tag,
-    Collection,
     Move,
     Bind,
 }
@@ -64,10 +64,383 @@ enum Mode {
         value: String,
         error: Option<String>,
     },
+    Collections(Box<CollectionsManager>),
     CommandPalette(CommandPalette),
     CommandOutput(CommandOutput),
     ConfirmMove(MovePlan),
     Help,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CollectionsFocus {
+    List,
+    Details,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CollectionDetailView {
+    Summary,
+    Json,
+}
+
+#[derive(Clone, Debug)]
+struct CollectionNameEntry {
+    value: String,
+    cursor: usize,
+}
+
+#[derive(Clone, Debug)]
+enum CollectionConfirmation {
+    Overwrite { name: String, existing_name: String },
+    Update(SavedCollection),
+    Delete(SavedCollection),
+}
+
+#[derive(Clone, Debug)]
+enum CollectionPrompt {
+    Name(CollectionNameEntry),
+    Confirm(Box<CollectionConfirmation>),
+}
+
+struct CollectionsManager {
+    collections: Vec<SavedCollection>,
+    bindings: Vec<wpaperd::Binding>,
+    current_filter: FilterSpecV1,
+    selected: usize,
+    focus: CollectionsFocus,
+    view: CollectionDetailView,
+    detail_scroll: usize,
+    detail_viewport_height: usize,
+    prompt: Option<CollectionPrompt>,
+    error: Option<String>,
+    notice: Option<String>,
+}
+
+enum CollectionsManagerCommand {
+    Continue,
+    Close,
+    Load(SavedCollection),
+    Save(String),
+    Update(SavedCollection),
+    Delete(SavedCollection),
+}
+
+impl CollectionsManager {
+    fn load(database: &Database, current_filter: &FilterSpecV1) -> Result<Self> {
+        let collections = list_collections(database)?;
+        let bindings = wpaperd::list_bindings(database)?;
+        let selected = collections
+            .iter()
+            .position(|collection| collection.filter == *current_filter)
+            .unwrap_or(0);
+        Ok(Self {
+            collections,
+            bindings,
+            current_filter: current_filter.clone(),
+            selected,
+            focus: CollectionsFocus::List,
+            view: CollectionDetailView::Summary,
+            detail_scroll: 0,
+            detail_viewport_height: 1,
+            prompt: None,
+            error: None,
+            notice: None,
+        })
+    }
+
+    fn selected(&self) -> Option<&SavedCollection> {
+        self.collections.get(self.selected)
+    }
+
+    fn bound_displays(&self, collection_id: i64) -> Vec<&str> {
+        self.bindings
+            .iter()
+            .filter(|binding| binding.active && binding.collection_id == collection_id)
+            .map(|binding| binding.display.as_str())
+            .collect()
+    }
+
+    fn replace_store(
+        &mut self,
+        collections: Vec<SavedCollection>,
+        bindings: Vec<wpaperd::Binding>,
+        preferred_id: Option<i64>,
+        fallback_selection: usize,
+    ) {
+        self.collections = collections;
+        self.bindings = bindings;
+        self.selected = preferred_id
+            .and_then(|id| {
+                self.collections
+                    .iter()
+                    .position(|collection| collection.id == id)
+            })
+            .unwrap_or_else(|| fallback_selection.min(self.collections.len().saturating_sub(1)));
+        self.detail_scroll = 0;
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> CollectionsManagerCommand {
+        if self.prompt.is_some() {
+            return self.handle_prompt_key(key);
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('c') => CollectionsManagerCommand::Close,
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.focus = match self.focus {
+                    CollectionsFocus::List => CollectionsFocus::Details,
+                    CollectionsFocus::Details => CollectionsFocus::List,
+                };
+                self.clear_feedback();
+                CollectionsManagerCommand::Continue
+            }
+            KeyCode::Left => {
+                self.focus = CollectionsFocus::List;
+                self.clear_feedback();
+                CollectionsManagerCommand::Continue
+            }
+            KeyCode::Right => {
+                self.focus = CollectionsFocus::Details;
+                self.clear_feedback();
+                CollectionsManagerCommand::Continue
+            }
+            KeyCode::Char('v') => {
+                self.view = match self.view {
+                    CollectionDetailView::Summary => CollectionDetailView::Json,
+                    CollectionDetailView::Json => CollectionDetailView::Summary,
+                };
+                self.detail_scroll = 0;
+                self.clear_feedback();
+                CollectionsManagerCommand::Continue
+            }
+            KeyCode::Char('s') => {
+                self.prompt = Some(CollectionPrompt::Name(CollectionNameEntry {
+                    value: String::new(),
+                    cursor: 0,
+                }));
+                self.clear_feedback();
+                CollectionsManagerCommand::Continue
+            }
+            KeyCode::Char('u') => {
+                if let Some(collection) = self.selected().cloned() {
+                    self.prompt = Some(CollectionPrompt::Confirm(Box::new(
+                        CollectionConfirmation::Update(collection),
+                    )));
+                    self.clear_feedback();
+                } else {
+                    self.error = Some(
+                        "There is no selected collection to update; press s to save one.".into(),
+                    );
+                    self.notice = None;
+                }
+                CollectionsManagerCommand::Continue
+            }
+            KeyCode::Char('d') => {
+                let Some(collection) = self.selected().cloned() else {
+                    self.error = Some(
+                        "There is no selected collection to delete; press s to save one.".into(),
+                    );
+                    self.notice = None;
+                    return CollectionsManagerCommand::Continue;
+                };
+                let displays = self.bound_displays(collection.id);
+                if displays.is_empty() {
+                    self.prompt = Some(CollectionPrompt::Confirm(Box::new(
+                        CollectionConfirmation::Delete(collection),
+                    )));
+                    self.clear_feedback();
+                } else {
+                    self.error = Some(format!(
+                        "Cannot delete {}: bound to wpaperd display(s) {}; unbind first.",
+                        collection.name,
+                        displays.join(", ")
+                    ));
+                    self.notice = None;
+                }
+                CollectionsManagerCommand::Continue
+            }
+            KeyCode::Enter => self.selected().cloned().map_or_else(
+                || {
+                    self.error = Some(
+                        "There is no collection to load; press s to save the current filter."
+                            .into(),
+                    );
+                    self.notice = None;
+                    CollectionsManagerCommand::Continue
+                },
+                CollectionsManagerCommand::Load,
+            ),
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.navigate(-1);
+                CollectionsManagerCommand::Continue
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.navigate(1);
+                CollectionsManagerCommand::Continue
+            }
+            KeyCode::PageUp => {
+                self.navigate(-self.page_size());
+                CollectionsManagerCommand::Continue
+            }
+            KeyCode::PageDown => {
+                self.navigate(self.page_size());
+                CollectionsManagerCommand::Continue
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                if self.focus == CollectionsFocus::List {
+                    self.select(0);
+                } else {
+                    self.detail_scroll = 0;
+                    self.clear_feedback();
+                }
+                CollectionsManagerCommand::Continue
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                if self.focus == CollectionsFocus::List {
+                    self.select(self.collections.len().saturating_sub(1));
+                } else {
+                    self.detail_scroll = self.max_detail_scroll();
+                    self.clear_feedback();
+                }
+                CollectionsManagerCommand::Continue
+            }
+            _ => CollectionsManagerCommand::Continue,
+        }
+    }
+
+    fn handle_prompt_key(&mut self, key: KeyEvent) -> CollectionsManagerCommand {
+        match self.prompt.as_mut() {
+            Some(CollectionPrompt::Name(entry)) => match key.code {
+                KeyCode::Esc => {
+                    self.prompt = None;
+                    self.error = None;
+                    CollectionsManagerCommand::Continue
+                }
+                KeyCode::Enter => CollectionsManagerCommand::Save(entry.value.clone()),
+                KeyCode::Left => {
+                    entry.cursor = entry.cursor.saturating_sub(1);
+                    self.error = None;
+                    CollectionsManagerCommand::Continue
+                }
+                KeyCode::Right => {
+                    entry.cursor = (entry.cursor + 1).min(entry.value.chars().count());
+                    self.error = None;
+                    CollectionsManagerCommand::Continue
+                }
+                KeyCode::Home => {
+                    entry.cursor = 0;
+                    self.error = None;
+                    CollectionsManagerCommand::Continue
+                }
+                KeyCode::End => {
+                    entry.cursor = entry.value.chars().count();
+                    self.error = None;
+                    CollectionsManagerCommand::Continue
+                }
+                KeyCode::Backspace => {
+                    if entry.cursor > 0 {
+                        replace_chars(&mut entry.value, entry.cursor - 1, entry.cursor, "");
+                        entry.cursor -= 1;
+                    }
+                    self.error = None;
+                    CollectionsManagerCommand::Continue
+                }
+                KeyCode::Delete => {
+                    if entry.cursor < entry.value.chars().count() {
+                        replace_chars(&mut entry.value, entry.cursor, entry.cursor + 1, "");
+                    }
+                    self.error = None;
+                    CollectionsManagerCommand::Continue
+                }
+                KeyCode::Char(character)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !character.is_control() =>
+                {
+                    let mut text = String::new();
+                    text.push(character);
+                    replace_chars(&mut entry.value, entry.cursor, entry.cursor, &text);
+                    entry.cursor += 1;
+                    self.error = None;
+                    CollectionsManagerCommand::Continue
+                }
+                _ => CollectionsManagerCommand::Continue,
+            },
+            Some(CollectionPrompt::Confirm(confirmation)) => match key.code {
+                KeyCode::Esc | KeyCode::Char('n' | 'N') => {
+                    self.prompt = None;
+                    self.error = None;
+                    CollectionsManagerCommand::Continue
+                }
+                KeyCode::Enter | KeyCode::Char('y' | 'Y') => match confirmation.as_ref().clone() {
+                    CollectionConfirmation::Overwrite { name, .. } => {
+                        CollectionsManagerCommand::Save(name)
+                    }
+                    CollectionConfirmation::Update(collection) => {
+                        CollectionsManagerCommand::Update(collection)
+                    }
+                    CollectionConfirmation::Delete(collection) => {
+                        CollectionsManagerCommand::Delete(collection)
+                    }
+                },
+                _ => CollectionsManagerCommand::Continue,
+            },
+            None => CollectionsManagerCommand::Continue,
+        }
+    }
+
+    fn paste(&mut self, value: &str) {
+        let Some(CollectionPrompt::Name(entry)) = self.prompt.as_mut() else {
+            return;
+        };
+        let value = value
+            .chars()
+            .filter(|character| !matches!(character, '\r' | '\n') && !character.is_control())
+            .collect::<String>();
+        replace_chars(&mut entry.value, entry.cursor, entry.cursor, &value);
+        entry.cursor += value.chars().count();
+        self.error = None;
+    }
+
+    fn navigate(&mut self, amount: isize) {
+        if self.focus == CollectionsFocus::List {
+            let selected = self
+                .selected
+                .saturating_add_signed(amount)
+                .min(self.collections.len().saturating_sub(1));
+            self.select(selected);
+        } else {
+            self.detail_scroll = self
+                .detail_scroll
+                .saturating_add_signed(amount)
+                .min(self.max_detail_scroll());
+            self.clear_feedback();
+        }
+    }
+
+    fn select(&mut self, selected: usize) {
+        self.selected = selected.min(self.collections.len().saturating_sub(1));
+        self.detail_scroll = 0;
+        self.clear_feedback();
+    }
+
+    fn page_size(&self) -> isize {
+        if self.focus == CollectionsFocus::List {
+            10
+        } else {
+            isize::try_from(self.detail_viewport_height.saturating_sub(1).max(1))
+                .unwrap_or(isize::MAX)
+        }
+    }
+
+    fn max_detail_scroll(&self) -> usize {
+        collection_detail_lines(self)
+            .len()
+            .saturating_sub(self.detail_viewport_height.max(1))
+    }
+
+    fn clear_feedback(&mut self) {
+        self.error = None;
+        self.notice = None;
+    }
 }
 
 struct CommandPalette {
@@ -762,6 +1135,12 @@ fn char_to_byte_index(value: &str, char_index: usize) -> usize {
         .char_indices()
         .nth(char_index)
         .map_or(value.len(), |(index, _)| index)
+}
+
+fn replace_chars(value: &mut String, start: usize, end: usize, replacement: &str) {
+    let start = char_to_byte_index(value, start);
+    let end = char_to_byte_index(value, end);
+    value.replace_range(start..end, replacement);
 }
 
 fn display_width(value: &str, start: usize, end: usize) -> usize {
@@ -2154,6 +2533,9 @@ fn handle_key(
     if matches!(&app.mode, Mode::FilterEditor(_)) {
         return handle_filter_editor_key(app, key, database, paths);
     }
+    if matches!(&app.mode, Mode::Collections(_)) {
+        return handle_collections_key(app, key, database, paths);
+    }
     if matches!(&app.mode, Mode::CommandPalette(_)) {
         return handle_command_palette_key(app, key, database);
     }
@@ -2163,6 +2545,7 @@ fn handle_key(
     match &mut app.mode {
         Mode::Browse => handle_browse_key(app, key, database, paths, config),
         Mode::FilterEditor(_) => unreachable!("filter editor handled above"),
+        Mode::Collections(_) => unreachable!("collections manager handled above"),
         Mode::CommandPalette(_) => unreachable!("command palette handled above"),
         Mode::CommandOutput(output) => {
             match key.code {
@@ -2367,9 +2750,189 @@ fn handle_filter_editor_key(
     Ok(())
 }
 
+fn handle_collections_key(
+    app: &mut App,
+    key: KeyEvent,
+    database: &Database,
+    paths: &AppPaths,
+) -> Result<()> {
+    let command = match &mut app.mode {
+        Mode::Collections(manager) => manager.handle_key(key),
+        _ => return Ok(()),
+    };
+    match command {
+        CollectionsManagerCommand::Continue => {}
+        CollectionsManagerCommand::Close => app.mode = Mode::Browse,
+        CollectionsManagerCommand::Load(collection) => {
+            if app.filter == collection.filter {
+                app.mode = Mode::Browse;
+                app.status = format!("Collection {} is already current", collection.name);
+                return Ok(());
+            }
+            let result = (|| -> Result<()> {
+                app.ensure_catalog_mutation_idle()?;
+                let previous_filter = std::mem::replace(&mut app.filter, collection.filter.clone());
+                if let Err(error) = app.reload(database, paths) {
+                    app.filter = previous_filter;
+                    return Err(error);
+                }
+                if app.semantic_receiver.is_some() {
+                    app.semantic_previous_filter = Some(previous_filter);
+                } else {
+                    app.status = format!("Loaded collection {}", collection.name);
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => app.mode = Mode::Browse,
+                Err(error) => set_collections_error(app, &error),
+            }
+        }
+        CollectionsManagerCommand::Save(name) => {
+            let name = name.trim().to_owned();
+            if name.is_empty() {
+                set_collections_error_message(app, "Collection name cannot be empty.");
+                return Ok(());
+            }
+            if name.chars().any(char::is_control) {
+                set_collections_error_message(
+                    app,
+                    "Collection name cannot contain control characters.",
+                );
+                return Ok(());
+            }
+            let awaiting_overwrite = matches!(
+                &app.mode,
+                Mode::Collections(manager)
+                    if matches!(
+                        manager.prompt,
+                        Some(CollectionPrompt::Confirm(ref confirmation))
+                            if matches!(
+                                confirmation.as_ref(),
+                                CollectionConfirmation::Overwrite { .. }
+                            )
+                    )
+            );
+            if !awaiting_overwrite {
+                let existing = match crate::collection::get_collection(database, &name) {
+                    Ok(existing) => existing,
+                    Err(error) => {
+                        set_collections_error(app, &error);
+                        return Ok(());
+                    }
+                };
+                if let Some(existing) = existing {
+                    if let Mode::Collections(manager) = &mut app.mode {
+                        manager.prompt = Some(CollectionPrompt::Confirm(Box::new(
+                            CollectionConfirmation::Overwrite {
+                                name,
+                                existing_name: existing.name,
+                            },
+                        )));
+                        manager.error = None;
+                        manager.notice = None;
+                    }
+                    return Ok(());
+                }
+            }
+            let result =
+                (|| -> Result<(SavedCollection, Vec<SavedCollection>, Vec<wpaperd::Binding>)> {
+                    app.ensure_catalog_mutation_idle()?;
+                    let saved = save_collection(database, &name, &app.filter)?;
+                    let collections = list_collections(database)?;
+                    let bindings = wpaperd::list_bindings(database)?;
+                    Ok((saved, collections, bindings))
+                })();
+            match result {
+                Ok((saved, collections, bindings)) => {
+                    if let Mode::Collections(manager) = &mut app.mode {
+                        manager.replace_store(collections, bindings, Some(saved.id), 0);
+                        manager.prompt = None;
+                        manager.error = None;
+                        manager.notice = Some(format!("Saved collection {}.", saved.name));
+                    }
+                    app.status = format!("Saved collection {}", saved.name);
+                    app.start_wpaperd_refresh(database, paths);
+                }
+                Err(error) => set_collections_error(app, &error),
+            }
+        }
+        CollectionsManagerCommand::Update(collection) => {
+            let result =
+                (|| -> Result<(SavedCollection, Vec<SavedCollection>, Vec<wpaperd::Binding>)> {
+                    app.ensure_catalog_mutation_idle()?;
+                    let saved = save_collection(database, &collection.name, &app.filter)?;
+                    let collections = list_collections(database)?;
+                    let bindings = wpaperd::list_bindings(database)?;
+                    Ok((saved, collections, bindings))
+                })();
+            match result {
+                Ok((saved, collections, bindings)) => {
+                    if let Mode::Collections(manager) = &mut app.mode {
+                        manager.replace_store(collections, bindings, Some(saved.id), 0);
+                        manager.prompt = None;
+                        manager.error = None;
+                        manager.notice = Some(format!(
+                            "Updated {} from the current browser filter.",
+                            saved.name
+                        ));
+                    }
+                    app.status = format!("Updated collection {}", saved.name);
+                    app.start_wpaperd_refresh(database, paths);
+                }
+                Err(error) => set_collections_error(app, &error),
+            }
+        }
+        CollectionsManagerCommand::Delete(collection) => {
+            let fallback_selection = match &app.mode {
+                Mode::Collections(manager) => manager.selected,
+                _ => 0,
+            };
+            let result = (|| -> Result<(Vec<SavedCollection>, Vec<wpaperd::Binding>)> {
+                app.ensure_catalog_mutation_idle()?;
+                anyhow::ensure!(
+                    delete_collection(database, &collection.name)?,
+                    "collection not found: {}",
+                    collection.name
+                );
+                Ok((
+                    list_collections(database)?,
+                    wpaperd::list_bindings(database)?,
+                ))
+            })();
+            match result {
+                Ok((collections, bindings)) => {
+                    if let Mode::Collections(manager) = &mut app.mode {
+                        manager.replace_store(collections, bindings, None, fallback_selection);
+                        manager.prompt = None;
+                        manager.error = None;
+                        manager.notice = Some(format!("Deleted collection {}.", collection.name));
+                    }
+                    app.status = format!("Deleted collection {}", collection.name);
+                    app.start_wpaperd_refresh(database, paths);
+                }
+                Err(error) => set_collections_error(app, &error),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn set_collections_error(app: &mut App, error: &anyhow::Error) {
+    set_collections_error_message(app, &format!("{error:#}"));
+}
+
+fn set_collections_error_message(app: &mut App, message: &str) {
+    if let Mode::Collections(manager) = &mut app.mode {
+        manager.error = Some(message.to_owned());
+        manager.notice = None;
+    }
+}
+
 fn handle_paste(app: &mut App, value: &str, database: &Database) {
     match &mut app.mode {
         Mode::FilterEditor(editor) => editor.paste(value),
+        Mode::Collections(manager) => manager.paste(value),
         Mode::CommandPalette(palette) => palette.paste(value, database),
         Mode::Input {
             value: input_value,
@@ -2448,11 +3011,8 @@ fn handle_browse_key(
             }
         }
         KeyCode::Char('c') => {
-            app.mode = Mode::Input {
-                action: InputAction::Collection,
-                value: String::new(),
-                error: None,
-            };
+            app.mode =
+                Mode::Collections(Box::new(CollectionsManager::load(database, &app.filter)?));
         }
         KeyCode::Char('m') => {
             if app.selected().is_some() {
@@ -2587,50 +3147,6 @@ fn submit_input(
                 app.status = format!("Added tag {value}");
             }
             app.start_wpaperd_refresh(database, paths);
-        }
-        InputAction::Collection => {
-            if value.eq_ignore_ascii_case("list") {
-                let names = list_collections(database)?
-                    .into_iter()
-                    .map(|collection| collection.name)
-                    .collect::<Vec<_>>();
-                app.status = if names.is_empty() {
-                    "No saved collections".into()
-                } else {
-                    format!("Collections: {}", names.join(", "))
-                };
-            } else if let Some(name) = value.strip_prefix("load ").map(str::trim) {
-                app.ensure_catalog_mutation_idle()?;
-                let collection = get_collection(database, name)?
-                    .with_context(|| format!("collection not found: {name}"))?;
-                let previous_filter = std::mem::replace(&mut app.filter, collection.filter);
-                if let Err(error) = app.reload(database, paths) {
-                    app.filter = previous_filter;
-                    return Err(error);
-                }
-                if app.semantic_receiver.is_some() {
-                    app.semantic_previous_filter = Some(previous_filter);
-                } else {
-                    app.status = format!("Loaded collection {}", collection.name);
-                }
-            } else if let Some(name) = value.strip_prefix("delete ").map(str::trim) {
-                app.ensure_catalog_mutation_idle()?;
-                if !delete_collection(database, name)? {
-                    anyhow::bail!("collection not found: {name}");
-                }
-                app.status = format!("Deleted collection {name}");
-                app.start_wpaperd_refresh(database, paths);
-            } else if !value.is_empty() {
-                app.ensure_catalog_mutation_idle()?;
-                let name = value
-                    .strip_prefix("save ")
-                    .map_or(value.as_str(), str::trim);
-                let collection = save_collection(database, name, &app.filter)?;
-                app.status = format!("Saved collection {}", collection.name);
-                app.start_wpaperd_refresh(database, paths);
-            } else {
-                anyhow::bail!("type a collection name, `load NAME`, `delete NAME`, or `list`");
-            }
         }
         InputAction::Move => {
             anyhow::ensure!(!value.is_empty(), "type a destination directory");
@@ -3057,22 +3573,278 @@ fn metadata_text(image: &ImageRecord) -> Text<'static> {
     Text::from(lines)
 }
 
+fn collection_detail_lines(manager: &CollectionsManager) -> Vec<Line<'static>> {
+    let Some(collection) = manager.selected() else {
+        return vec![
+            Line::from(Span::styled(
+                "No saved collections",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from("Press s to save the current browser filter."),
+            Line::from("The new collection will also be available to the CLI and wpaperd."),
+        ];
+    };
+    let displays = manager.bound_displays(collection.id);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            collection.name.clone(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(format!(
+            "Created: {}",
+            format_collection_timestamp(collection.created_at)
+        )),
+        Line::from(format!(
+            "Updated: {}",
+            format_collection_timestamp(collection.updated_at)
+        )),
+        Line::from(format!(
+            "Current browser filter: {}",
+            if collection.filter == manager.current_filter {
+                "exact match"
+            } else {
+                "different"
+            }
+        )),
+        Line::from(format!(
+            "wpaperd displays: {}",
+            if displays.is_empty() {
+                "none".into()
+            } else {
+                displays.join(", ")
+            }
+        )),
+        Line::from(""),
+    ];
+    match manager.view {
+        CollectionDetailView::Summary => {
+            lines.push(Line::from(Span::styled(
+                "Filter facets",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            lines.extend(
+                readable_filter_summary(&collection.filter)
+                    .into_iter()
+                    .map(Line::from),
+            );
+        }
+        CollectionDetailView::Json => {
+            lines.push(Line::from(Span::styled(
+                "FilterSpecV1 JSON",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            let json = serde_json::to_string_pretty(&collection.filter)
+                .unwrap_or_else(|error| format!("Could not serialize filter: {error}"));
+            lines.extend(json.lines().map(|line| Line::from(line.to_owned())));
+        }
+    }
+    lines
+}
+
+fn readable_filter_summary(filter: &FilterSpecV1) -> Vec<String> {
+    let default = FilterSpecV1::default();
+    let mut lines = Vec::new();
+    if !filter.source_ids.is_empty() {
+        lines.push(format!(
+            "Source IDs (any): {}",
+            join_values(&filter.source_ids)
+        ));
+    }
+    if !filter.paths.is_empty() {
+        lines.push(format!("Path contains (any): {}", filter.paths.join(", ")));
+    }
+    if let Some(value) = filter.min_width {
+        lines.push(format!("Minimum width: {value} px"));
+    }
+    if let Some(value) = filter.max_width {
+        lines.push(format!("Maximum width: {value} px"));
+    }
+    if let Some(value) = filter.min_height {
+        lines.push(format!("Minimum height: {value} px"));
+    }
+    if let Some(value) = filter.max_height {
+        lines.push(format!("Maximum height: {value} px"));
+    }
+    if !filter.orientations.is_empty() {
+        lines.push(format!(
+            "Orientations (any): {}",
+            filter
+                .orientations
+                .iter()
+                .map(|orientation| orientation.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !filter.aspect_ratios.is_empty() {
+        lines.push(format!(
+            "Aspect ratios (any): {}",
+            filter
+                .aspect_ratios
+                .iter()
+                .map(|ratio| concise_decimal(*ratio))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if filter.aspect_tolerance != default.aspect_tolerance {
+        lines.push(format!(
+            "Aspect tolerance: {}%",
+            concise_decimal(filter.aspect_tolerance * 100.0)
+        ));
+    }
+    if !filter.light_dark.is_empty() {
+        lines.push(format!(
+            "Light/dark (any): {}",
+            filter
+                .light_dark
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if let Some(value) = filter.min_luminance {
+        lines.push(format!("Minimum luminance: {}", concise_decimal(value)));
+    }
+    if let Some(value) = filter.max_luminance {
+        lines.push(format!("Maximum luminance: {}", concise_decimal(value)));
+    }
+    for colour in &filter.dominant_colours {
+        lines.push(format!(
+            "Dominant colour (any): {} within Oklab distance {}",
+            colour.hex,
+            concise_decimal(colour.max_distance)
+        ));
+    }
+    for colour in &filter.palette_colours {
+        lines.push(format!(
+            "Palette colour (any): {} within Oklab distance {}",
+            colour.hex,
+            concise_decimal(colour.max_distance)
+        ));
+    }
+    for label in &filter.ai_labels {
+        lines.push(format!(
+            "AI label (any): {} / {} at least {}",
+            label.pack,
+            label.label,
+            concise_decimal(label.min_score)
+        ));
+    }
+    if let Some(text) = &filter.semantic_text {
+        lines.push(format!("Semantic text: {text}"));
+    }
+    if let Some(value) = filter.semantic_min_score {
+        lines.push(format!(
+            "Minimum semantic score: {}",
+            concise_decimal(value)
+        ));
+    }
+    if !filter.tags.is_empty() {
+        lines.push(format!("Tags (any): {}", filter.tags.join(", ")));
+    }
+    if let Some(favorite) = filter.favorite {
+        lines.push(format!(
+            "Favourite: {}",
+            if favorite { "yes" } else { "no" }
+        ));
+    }
+    if lines.is_empty() {
+        lines.push("No filter facets — includes every ready wallpaper.".into());
+    }
+    lines
+}
+
+fn join_values<T: ToString>(values: &[T]) -> String {
+    values
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn concise_decimal(value: impl Into<f64>) -> String {
+    let value = value.into();
+    let formatted = format!("{value:.3}");
+    formatted
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_owned()
+}
+
+fn format_collection_timestamp(milliseconds: i64) -> String {
+    DateTime::<Utc>::from_timestamp_millis(milliseconds).map_or_else(
+        || format!("invalid timestamp ({milliseconds})"),
+        |timestamp| timestamp.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+    )
+}
+
 fn render_modal(frame: &mut Frame<'_>, app: &mut App) {
     match &mut app.mode {
         Mode::Browse => {}
         Mode::FilterEditor(editor) => render_filter_editor(frame, editor),
+        Mode::Collections(manager) => render_collections_manager(frame, manager),
         Mode::CommandPalette(palette) => render_command_palette(frame, palette),
         Mode::CommandOutput(output) => render_command_output(frame, output),
         Mode::Help => {
-            let area = centered_fixed_height(82, 26, frame.area());
+            let area = centered_rect(96, 96, frame.area());
             frame.render_widget(Clear, area);
+            let block = Block::default().borders(Borders::ALL).title(" Help ");
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            let columns = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(inner);
             frame.render_widget(
-                Paragraph::new(
-                    "Browse\n↑/↓, j/k    navigate\na / s        add a source / scan in background\n/ / r        edit filter / show all wallpapers\nf / t        favorite / add or `remove TAG`\nc / m / w    collections / move / wpaperd binding\n:            run any non-TUI bgm command\no or Enter   open original; q quits\n\nCommand palette\nTab / ↑/↓    complete / choose suggestion\nCtrl+P/N     previous / next command in history\n←/→ Home End edit; Ctrl+W deletes a word\nEnter runs; Esc closes\n\nFilter editor\nCtrl+Space   show JSON IntelliSense\nTab / ↑/↓    accept / choose suggestion\nCtrl+P       save JSON as a named preset\nCtrl+S/R     apply / reset filter; Esc cancels\n\nPress any key to close help.",
-                )
-                .wrap(Wrap { trim: false })
-                .block(Block::default().borders(Borders::ALL).title(" Help ")),
-                area,
+                Paragraph::new(concat!(
+                    "Browse\n",
+                    "↑/↓, j/k    navigate\n",
+                    "a / s       add source / scan\n",
+                    "/ / r       edit / reset filter\n",
+                    "f / t       favorite / tags\n",
+                    "c / m / w   collections / move / bind\n",
+                    ":           command palette\n",
+                    "o / Enter   open; q quits\n\n",
+                    "Collections manager\n",
+                    "↑/↓         select / scroll\n",
+                    "Tab, ←/→    switch pane\n",
+                    "Enter       load selected\n",
+                    "s / u / d   save / update / delete\n",
+                    "v           readable / JSON\n",
+                    "Esc / c     cancel / close",
+                ))
+                .wrap(Wrap { trim: false }),
+                columns[0],
+            );
+            frame.render_widget(
+                Paragraph::new(concat!(
+                    "Command palette\n",
+                    "Tab / ↑/↓    complete / choose\n",
+                    "Ctrl+P/N     command history\n",
+                    "←/→ Home End edit\n",
+                    "Ctrl+W       delete a word\n",
+                    "Enter runs; Esc closes\n\n",
+                    "Filter editor\n",
+                    "Ctrl+Space   JSON IntelliSense\n",
+                    "Tab / ↑/↓    accept / choose\n",
+                    "Ctrl+P       save named preset\n",
+                    "Ctrl+S/R     apply / reset\n",
+                    "Esc          cancel\n\n",
+                    "Press any key to close help.",
+                ))
+                .wrap(Wrap { trim: false }),
+                columns[1],
             );
         }
         Mode::Input {
@@ -3086,10 +3858,6 @@ fn render_modal(frame: &mut Frame<'_>, app: &mut App) {
                     "directory to scan; ~/ paths are supported",
                 ),
                 InputAction::Tag => (" Change tags ", "TAG to add, or: remove TAG"),
-                InputAction::Collection => (
-                    " Manage collections ",
-                    "NAME/save NAME, load NAME, delete NAME, or list",
-                ),
                 InputAction::Move => (" Move preview ", "destination directory"),
                 InputAction::Bind => (
                     " Manage wpaperd binding ",
@@ -3155,6 +3923,259 @@ fn render_modal(frame: &mut Frame<'_>, app: &mut App) {
                 area,
             );
         }
+    }
+}
+
+fn render_collections_manager(frame: &mut Frame<'_>, manager: &mut CollectionsManager) {
+    let area = centered_rect(94, 88, frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Collections manager ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(4)])
+        .split(inner);
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+        .split(sections[0]);
+
+    let list_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(
+            Style::default().fg(if manager.focus == CollectionsFocus::List {
+                Color::Cyan
+            } else {
+                Color::DarkGray
+            }),
+        )
+        .title(" Saved collections ");
+    if manager.collections.is_empty() {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "No saved collections",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from("Press s to save the"),
+                Line::from("current browser filter."),
+            ])
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: false })
+            .block(list_block),
+            panes[0],
+        );
+    } else {
+        let items = manager
+            .collections
+            .iter()
+            .map(|collection| {
+                let current = if collection.filter == manager.current_filter {
+                    "●"
+                } else {
+                    " "
+                };
+                let bound = if manager.bound_displays(collection.id).is_empty() {
+                    " "
+                } else {
+                    "W"
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("{current} "), Style::default().fg(Color::Cyan)),
+                    Span::styled(format!("{bound} "), Style::default().fg(Color::Magenta)),
+                    Span::raw(collection.name.clone()),
+                ]))
+            })
+            .collect::<Vec<_>>();
+        let mut state = ListState::default().with_selected(Some(manager.selected));
+        frame.render_stateful_widget(
+            List::new(items)
+                .highlight_symbol("▸ ")
+                .highlight_style(
+                    Style::default()
+                        .bg(Color::Rgb(35, 48, 65))
+                        .add_modifier(Modifier::BOLD),
+                )
+                .block(list_block),
+            panes[0],
+            &mut state,
+        );
+    }
+
+    let detail_title = match manager.view {
+        CollectionDetailView::Summary => " Details — readable ",
+        CollectionDetailView::Json => " Details — JSON ",
+    };
+    let detail_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(
+            Style::default().fg(if manager.focus == CollectionsFocus::Details {
+                Color::Cyan
+            } else {
+                Color::DarkGray
+            }),
+        )
+        .title(detail_title);
+    let detail_inner = detail_block.inner(panes[1]);
+    manager.detail_viewport_height = usize::from(detail_inner.height).max(1);
+    manager.detail_scroll = manager.detail_scroll.min(manager.max_detail_scroll());
+    let details = collection_detail_lines(manager);
+    frame.render_widget(
+        Paragraph::new(details)
+            .scroll((u16::try_from(manager.detail_scroll).unwrap_or(u16::MAX), 0))
+            .wrap(Wrap { trim: false })
+            .block(detail_block),
+        panes[1],
+    );
+
+    let feedback = if let Some(error) = &manager.error {
+        Span::styled(format!("Error: {error}"), Style::default().fg(Color::Red))
+    } else if let Some(notice) = &manager.notice {
+        Span::styled(notice.clone(), Style::default().fg(Color::Green))
+    } else {
+        Span::styled(
+            "● current filter • W active wpaperd binding",
+            Style::default().fg(Color::DarkGray),
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from("Enter load • s save new • u update • d delete • v readable/JSON"),
+            Line::from("Tab or ←/→ switches pane • ↑/↓, Page Up/Down, Home/End navigate"),
+            Line::from("Esc closes or cancels a prompt first • c closes"),
+            Line::from(feedback),
+        ])
+        .wrap(Wrap { trim: false }),
+        sections[1],
+    );
+
+    if manager.prompt.is_some() {
+        render_collection_prompt(frame, manager, area);
+    }
+}
+
+fn render_collection_prompt(frame: &mut Frame<'_>, manager: &CollectionsManager, parent: Rect) {
+    match manager.prompt.as_ref() {
+        Some(CollectionPrompt::Name(entry)) => {
+            let area = centered_fixed_height(70, 10, parent);
+            frame.render_widget(Clear, area);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(" Save current filter as a new collection ");
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            let sections = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1),
+                    Constraint::Length(3),
+                    Constraint::Min(1),
+                ])
+                .split(inner);
+            frame.render_widget(
+                Paragraph::new("Enter a collection name; matching names require confirmation."),
+                sections[0],
+            );
+            let input_block = Block::default().borders(Borders::ALL).title(" Name ");
+            let input_inner = input_block.inner(sections[1]);
+            frame.render_widget(input_block, sections[1]);
+            let content_width = usize::from(input_inner.width.saturating_sub(2)).max(1);
+            let mut scroll = 0;
+            while display_width(&entry.value, scroll, entry.cursor) >= content_width
+                && scroll < entry.cursor
+            {
+                scroll += 1;
+            }
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("> ", Style::default().fg(Color::Cyan)),
+                    Span::raw(visible_text(&entry.value, scroll, content_width)),
+                ])),
+                input_inner,
+            );
+            let feedback = manager.error.as_ref().map_or_else(
+                || {
+                    Line::from(
+                        "←/→ Home End move • Delete/Backspace edit • Enter saves • Esc cancels",
+                    )
+                },
+                |error| {
+                    Line::from(Span::styled(
+                        format!("Error: {error}"),
+                        Style::default().fg(Color::Red),
+                    ))
+                },
+            );
+            frame.render_widget(
+                Paragraph::new(feedback).wrap(Wrap { trim: false }),
+                sections[2],
+            );
+            let cursor_x = u16::try_from(display_width(&entry.value, scroll, entry.cursor))
+                .unwrap_or(u16::MAX)
+                .min(input_inner.width.saturating_sub(3));
+            frame.set_cursor_position((input_inner.x + 2 + cursor_x, input_inner.y));
+        }
+        Some(CollectionPrompt::Confirm(confirmation)) => {
+            let (title, message) = match confirmation.as_ref() {
+                CollectionConfirmation::Overwrite { existing_name, .. } => (
+                    " Confirm overwrite ",
+                    format!(
+                        "A collection named {existing_name} already exists. Replace its filter with the current browser filter?"
+                    ),
+                ),
+                CollectionConfirmation::Update(collection) => (
+                    " Confirm update ",
+                    format!(
+                        "Replace the filter saved in {} with the current browser filter?",
+                        collection.name
+                    ),
+                ),
+                CollectionConfirmation::Delete(collection) => (
+                    " Confirm deletion ",
+                    format!(
+                        "Delete collection {}? This cannot be undone.",
+                        collection.name
+                    ),
+                ),
+            };
+            let area = centered_fixed_height(70, 9, parent);
+            frame.render_widget(Clear, area);
+            let feedback = manager.error.as_ref().map_or_else(
+                || Line::from("Enter or y confirms • n or Esc cancels"),
+                |error| {
+                    Line::from(Span::styled(
+                        format!("Error: {error}"),
+                        Style::default().fg(Color::Red),
+                    ))
+                },
+            );
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(Span::styled(
+                        message,
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(""),
+                    feedback,
+                ])
+                .wrap(Wrap { trim: false })
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Yellow))
+                        .title(title),
+                ),
+                area,
+            );
+        }
+        None => {}
     }
 }
 
@@ -3706,7 +4727,7 @@ fn parse_terminal_colour(hex: &str) -> Option<Color> {
 mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
-    use crate::db::ImageStatus;
+    use crate::{collection::get_collection, db::ImageStatus};
 
     use super::*;
 
@@ -3999,6 +5020,73 @@ mod tests {
         (directory, paths, database, app)
     }
 
+    fn collection_key(app: &mut App, code: KeyCode, database: &Database, paths: &AppPaths) {
+        handle_collections_key(
+            app,
+            KeyEvent::new(code, KeyModifiers::NONE),
+            database,
+            paths,
+        )
+        .expect("handle collections key");
+    }
+
+    fn type_collection_name(app: &mut App, value: &str, database: &Database, paths: &AppPaths) {
+        for character in value.chars() {
+            collection_key(app, KeyCode::Char(character), database, paths);
+        }
+    }
+
+    fn saved_collection(id: i64, name: &str, filter: FilterSpecV1) -> SavedCollection {
+        SavedCollection {
+            id,
+            name: name.into(),
+            filter,
+            created_at: 1_700_000_000_000,
+            updated_at: 1_700_003_661_000,
+        }
+    }
+
+    fn populated_collections_manager() -> CollectionsManager {
+        let current_filter = FilterSpecV1 {
+            min_width: Some(2560),
+            orientations: vec![Orientation::Landscape],
+            aspect_ratios: vec![16.0 / 9.0, 21.0 / 9.0],
+            aspect_tolerance: 0.05,
+            light_dark: vec![LightDark::Dark],
+            palette_colours: vec![ColourFilter {
+                hex: "#D08040".into(),
+                max_distance: 0.1,
+            }],
+            tags: vec!["desktop".into(), "warm".into()],
+            favorite: Some(true),
+            ..FilterSpecV1::default()
+        };
+        CollectionsManager {
+            collections: vec![
+                saved_collection(1, "All wallpapers", FilterSpecV1::default()),
+                saved_collection(2, "Warm widescreen", current_filter.clone()),
+            ],
+            bindings: vec![wpaperd::Binding {
+                display: "DP-1".into(),
+                collection_id: 2,
+                collection_name: "Warm widescreen".into(),
+                pool_path: "/tmp/bgm-test-pool".into(),
+                displaced_path: None,
+                active: true,
+                refreshed_at: Some(1_700_003_661_000),
+            }],
+            current_filter,
+            selected: 1,
+            focus: CollectionsFocus::List,
+            view: CollectionDetailView::Summary,
+            detail_scroll: 0,
+            detail_viewport_height: 1,
+            prompt: None,
+            error: None,
+            notice: None,
+        }
+    }
+
     #[test]
     fn first_run_screen_explains_how_to_build_the_catalog() {
         let (_directory, _paths, _database, mut app) = empty_runtime();
@@ -4119,6 +5207,393 @@ mod tests {
 
         assert!(app.selected().expect("image").tags.is_empty());
         assert_eq!(app.status, "Removed tag desktop");
+    }
+
+    #[test]
+    fn collections_manager_selects_the_current_filter_and_navigates_both_panes() {
+        let (_directory, paths, database, mut app) = empty_runtime();
+        let portrait = FilterSpecV1 {
+            orientations: vec![Orientation::Portrait],
+            ..FilterSpecV1::default()
+        };
+        save_collection(&database, "All", &FilterSpecV1::default()).expect("save all");
+        save_collection(&database, "Portrait", &portrait).expect("save portrait");
+        save_collection(
+            &database,
+            "Wide",
+            &FilterSpecV1 {
+                min_width: Some(2560),
+                ..FilterSpecV1::default()
+            },
+        )
+        .expect("save wide");
+        app.filter = portrait;
+        app.mode = Mode::Collections(Box::new(
+            CollectionsManager::load(&database, &app.filter).expect("manager"),
+        ));
+
+        let Mode::Collections(manager) = &app.mode else {
+            panic!("manager did not open");
+        };
+        assert_eq!(manager.selected().expect("selection").name, "Portrait");
+
+        collection_key(&mut app, KeyCode::Up, &database, &paths);
+        collection_key(&mut app, KeyCode::Right, &database, &paths);
+        collection_key(&mut app, KeyCode::Char('v'), &database, &paths);
+        if let Mode::Collections(manager) = &mut app.mode {
+            manager.detail_viewport_height = 3;
+        }
+        collection_key(&mut app, KeyCode::PageDown, &database, &paths);
+
+        let Mode::Collections(manager) = &app.mode else {
+            panic!("manager closed while navigating");
+        };
+        assert_eq!(manager.selected().expect("selection").name, "All");
+        assert_eq!(manager.focus, CollectionsFocus::Details);
+        assert_eq!(manager.view, CollectionDetailView::Json);
+        assert!(manager.detail_scroll > 0);
+        collection_key(&mut app, KeyCode::Tab, &database, &paths);
+        assert!(matches!(
+            &app.mode,
+            Mode::Collections(manager) if manager.focus == CollectionsFocus::List
+        ));
+    }
+
+    #[test]
+    fn empty_collections_manager_explains_save_and_escape_priority() {
+        let (_directory, paths, database, mut app) = empty_runtime();
+        app.mode = Mode::Collections(Box::new(
+            CollectionsManager::load(&database, &app.filter).expect("manager"),
+        ));
+
+        collection_key(&mut app, KeyCode::Enter, &database, &paths);
+        assert!(matches!(
+            &app.mode,
+            Mode::Collections(manager)
+                if manager.error.as_deref().is_some_and(|error| error.contains("press s"))
+        ));
+        collection_key(&mut app, KeyCode::Char('s'), &database, &paths);
+        collection_key(&mut app, KeyCode::Esc, &database, &paths);
+        assert!(matches!(
+            &app.mode,
+            Mode::Collections(manager) if manager.prompt.is_none()
+        ));
+        collection_key(&mut app, KeyCode::Esc, &database, &paths);
+        assert!(matches!(app.mode, Mode::Browse));
+    }
+
+    #[test]
+    fn collections_manager_loads_filters_and_keeps_model_errors_open() {
+        let (_directory, paths, database, mut app) = runtime_with_image();
+        let favorite = FilterSpecV1 {
+            favorite: Some(true),
+            ..FilterSpecV1::default()
+        };
+        save_collection(&database, "Favourites", &favorite).expect("save favorites");
+        app.mode = Mode::Collections(Box::new(
+            CollectionsManager::load(&database, &app.filter).expect("manager"),
+        ));
+
+        collection_key(&mut app, KeyCode::Enter, &database, &paths);
+
+        assert!(matches!(app.mode, Mode::Browse));
+        assert_eq!(app.filter, favorite);
+        assert!(app.images.is_empty());
+        assert_eq!(app.status, "Loaded collection Favourites");
+
+        save_collection(&database, "Current", &favorite).expect("save current");
+        app.mode = Mode::Collections(Box::new(
+            CollectionsManager::load(&database, &app.filter).expect("manager"),
+        ));
+        collection_key(&mut app, KeyCode::Enter, &database, &paths);
+        assert!(matches!(app.mode, Mode::Browse));
+        assert_eq!(app.status, "Collection Current is already current");
+
+        let semantic = FilterSpecV1 {
+            semantic_text: Some("misty forest".into()),
+            ..FilterSpecV1::default()
+        };
+        save_collection(&database, "Semantic", &semantic).expect("save semantic");
+        app.filter = FilterSpecV1::default();
+        app.mode = Mode::Collections(Box::new(
+            CollectionsManager::load(&database, &app.filter).expect("manager"),
+        ));
+        if let Mode::Collections(manager) = &mut app.mode {
+            manager.selected = manager
+                .collections
+                .iter()
+                .position(|collection| collection.name == "Semantic")
+                .expect("semantic selection");
+        }
+        collection_key(&mut app, KeyCode::Enter, &database, &paths);
+        assert_eq!(app.filter, FilterSpecV1::default());
+        assert!(matches!(
+            &app.mode,
+            Mode::Collections(manager)
+                if manager.error.as_deref().is_some_and(|error| error.contains("model installed"))
+        ));
+    }
+
+    #[test]
+    fn collections_manager_saves_and_confirms_case_insensitive_overwrites() {
+        let (_directory, paths, database, mut app) = empty_runtime();
+        save_collection(&database, "Night", &FilterSpecV1::default()).expect("save existing");
+        app.filter.favorite = Some(true);
+        app.mode = Mode::Collections(Box::new(
+            CollectionsManager::load(&database, &app.filter).expect("manager"),
+        ));
+
+        collection_key(&mut app, KeyCode::Char('s'), &database, &paths);
+        type_collection_name(&mut app, "night", &database, &paths);
+        collection_key(&mut app, KeyCode::Enter, &database, &paths);
+        assert!(matches!(
+            &app.mode,
+            Mode::Collections(manager)
+                if matches!(
+                    manager.prompt,
+                    Some(CollectionPrompt::Confirm(ref confirmation))
+                        if matches!(
+                            confirmation.as_ref(),
+                            CollectionConfirmation::Overwrite { existing_name, .. }
+                                if existing_name == "Night"
+                        )
+                )
+        ));
+        collection_key(&mut app, KeyCode::Esc, &database, &paths);
+        assert_eq!(
+            get_collection(&database, "Night")
+                .expect("read")
+                .expect("existing")
+                .filter
+                .favorite,
+            None
+        );
+
+        collection_key(&mut app, KeyCode::Char('s'), &database, &paths);
+        type_collection_name(&mut app, "NIGHT", &database, &paths);
+        collection_key(&mut app, KeyCode::Enter, &database, &paths);
+        collection_key(&mut app, KeyCode::Char('y'), &database, &paths);
+
+        let saved = get_collection(&database, "night")
+            .expect("read")
+            .expect("overwritten");
+        assert_eq!(saved.name, "Night");
+        assert_eq!(saved.filter.favorite, Some(true));
+        assert!(matches!(
+            &app.mode,
+            Mode::Collections(manager)
+                if manager.selected().is_some_and(|collection| collection.id == saved.id)
+                    && manager.notice.as_deref() == Some("Saved collection Night.")
+        ));
+        assert_eq!(app.status, "Saved collection Night");
+    }
+
+    #[test]
+    fn collections_manager_updates_only_after_confirmation() {
+        let (_directory, paths, database, mut app) = empty_runtime();
+        save_collection(&database, "Desktop", &FilterSpecV1::default()).expect("save");
+        app.filter.tags = vec!["desktop".into()];
+        app.mode = Mode::Collections(Box::new(
+            CollectionsManager::load(&database, &app.filter).expect("manager"),
+        ));
+
+        collection_key(&mut app, KeyCode::Char('u'), &database, &paths);
+        collection_key(&mut app, KeyCode::Esc, &database, &paths);
+        assert!(
+            get_collection(&database, "Desktop")
+                .expect("read")
+                .expect("collection")
+                .filter
+                .tags
+                .is_empty()
+        );
+
+        collection_key(&mut app, KeyCode::Char('u'), &database, &paths);
+        collection_key(&mut app, KeyCode::Enter, &database, &paths);
+        assert_eq!(
+            get_collection(&database, "Desktop")
+                .expect("read")
+                .expect("updated")
+                .filter
+                .tags,
+            ["desktop"]
+        );
+        assert!(matches!(
+            &app.mode,
+            Mode::Collections(manager)
+                if manager.notice.as_deref().is_some_and(|notice| notice.contains("Updated Desktop"))
+        ));
+    }
+
+    #[test]
+    fn collections_manager_cancels_or_confirms_deletion_and_keeps_nearest_selection() {
+        let (_directory, paths, database, mut app) = empty_runtime();
+        for name in ["Alpha", "Bravo", "Charlie"] {
+            save_collection(&database, name, &FilterSpecV1::default()).expect("save");
+        }
+        app.mode = Mode::Collections(Box::new(
+            CollectionsManager::load(&database, &app.filter).expect("manager"),
+        ));
+        if let Mode::Collections(manager) = &mut app.mode {
+            manager.selected = 1;
+        }
+
+        collection_key(&mut app, KeyCode::Char('d'), &database, &paths);
+        collection_key(&mut app, KeyCode::Char('n'), &database, &paths);
+        assert!(get_collection(&database, "Bravo").expect("read").is_some());
+
+        collection_key(&mut app, KeyCode::Char('d'), &database, &paths);
+        collection_key(&mut app, KeyCode::Char('y'), &database, &paths);
+
+        assert!(get_collection(&database, "Bravo").expect("read").is_none());
+        assert!(matches!(
+            &app.mode,
+            Mode::Collections(manager)
+                if manager.selected().is_some_and(|collection| collection.name == "Charlie")
+                    && manager.notice.as_deref() == Some("Deleted collection Bravo.")
+        ));
+        assert_eq!(app.status, "Deleted collection Bravo");
+    }
+
+    #[test]
+    fn collections_manager_refuses_to_delete_bound_collections_and_lists_displays() {
+        let (_directory, paths, database, mut app) = runtime_with_image();
+        save_collection(&database, "Displayed", &FilterSpecV1::default()).expect("save");
+        wpaperd::bind(&database, &paths, "any", "Displayed").expect("bind any");
+        wpaperd::bind(&database, &paths, "DP-1", "Displayed").expect("bind DP-1");
+        app.mode = Mode::Collections(Box::new(
+            CollectionsManager::load(&database, &app.filter).expect("manager"),
+        ));
+
+        collection_key(&mut app, KeyCode::Char('d'), &database, &paths);
+
+        assert!(
+            get_collection(&database, "Displayed")
+                .expect("read")
+                .is_some()
+        );
+        assert!(matches!(
+            &app.mode,
+            Mode::Collections(manager)
+                if manager.prompt.is_none()
+                    && manager.error.as_deref().is_some_and(|error| {
+                        error.contains("any, DP-1") && error.contains("unbind first")
+                    })
+        ));
+    }
+
+    #[test]
+    fn collection_name_entry_supports_editing_paste_and_persists_after_errors() {
+        let (_directory, paths, database, mut app) = empty_runtime();
+        app.mode = Mode::Collections(Box::new(
+            CollectionsManager::load(&database, &app.filter).expect("manager"),
+        ));
+        collection_key(&mut app, KeyCode::Char('s'), &database, &paths);
+        type_collection_name(&mut app, "ac", &database, &paths);
+        collection_key(&mut app, KeyCode::Left, &database, &paths);
+        handle_paste(&mut app, "β\n", &database);
+        collection_key(&mut app, KeyCode::Home, &database, &paths);
+        collection_key(&mut app, KeyCode::Delete, &database, &paths);
+        collection_key(&mut app, KeyCode::End, &database, &paths);
+        collection_key(&mut app, KeyCode::Backspace, &database, &paths);
+        assert!(matches!(
+            &app.mode,
+            Mode::Collections(manager)
+                if matches!(
+                    manager.prompt,
+                    Some(CollectionPrompt::Name(CollectionNameEntry { ref value, cursor: 1 }))
+                        if value == "β"
+                )
+        ));
+        collection_key(&mut app, KeyCode::Enter, &database, &paths);
+        assert!(get_collection(&database, "β").expect("read").is_some());
+
+        app.wpaperd_receiver = None;
+        app.wpaperd_refresh_queued = false;
+        collection_key(&mut app, KeyCode::Char('s'), &database, &paths);
+        type_collection_name(&mut app, "   ", &database, &paths);
+        collection_key(&mut app, KeyCode::Enter, &database, &paths);
+        assert!(matches!(
+            &app.mode,
+            Mode::Collections(manager)
+                if matches!(manager.prompt, Some(CollectionPrompt::Name(_)))
+                    && manager.error.as_deref() == Some("Collection name cannot be empty.")
+        ));
+        collection_key(&mut app, KeyCode::Esc, &database, &paths);
+
+        let (_sender, receiver) = unbounded();
+        app.wpaperd_receiver = Some(receiver);
+        collection_key(&mut app, KeyCode::Char('s'), &database, &paths);
+        type_collection_name(&mut app, "Busy", &database, &paths);
+        collection_key(&mut app, KeyCode::Enter, &database, &paths);
+        assert!(matches!(
+            &app.mode,
+            Mode::Collections(manager)
+                if matches!(manager.prompt, Some(CollectionPrompt::Name(_)))
+                    && manager.error.as_deref().is_some_and(|error| error.contains("wpaperd worker"))
+        ));
+        assert!(get_collection(&database, "Busy").expect("read").is_none());
+    }
+
+    #[test]
+    fn readable_collection_summary_includes_every_filter_facet() {
+        let filter = FilterSpecV1 {
+            source_ids: vec![1, 2],
+            paths: vec!["mountain".into()],
+            min_width: Some(100),
+            max_width: Some(200),
+            min_height: Some(300),
+            max_height: Some(400),
+            orientations: vec![Orientation::Landscape],
+            aspect_ratios: vec![16.0 / 9.0],
+            aspect_tolerance: 0.05,
+            light_dark: vec![LightDark::Dark],
+            min_luminance: Some(0.1),
+            max_luminance: Some(0.9),
+            dominant_colours: vec![ColourFilter {
+                hex: "#112233".into(),
+                max_distance: 0.1,
+            }],
+            palette_colours: vec![ColourFilter {
+                hex: "#445566".into(),
+                max_distance: 0.2,
+            }],
+            ai_labels: vec![crate::filter::AiLabelFilter {
+                pack: "mood".into(),
+                label: "calm".into(),
+                min_score: 0.7,
+            }],
+            semantic_text: Some("mist".into()),
+            semantic_min_score: Some(0.25),
+            tags: vec!["desktop".into()],
+            favorite: Some(false),
+            ..FilterSpecV1::default()
+        };
+        let summary = readable_filter_summary(&filter).join("\n");
+
+        for label in [
+            "Source IDs",
+            "Path contains",
+            "Minimum width",
+            "Maximum width",
+            "Minimum height",
+            "Maximum height",
+            "Orientations",
+            "Aspect ratios",
+            "Aspect tolerance",
+            "Light/dark",
+            "Minimum luminance",
+            "Maximum luminance",
+            "Dominant colour",
+            "Palette colour",
+            "AI label",
+            "Semantic text",
+            "Minimum semantic score",
+            "Tags",
+            "Favourite: no",
+        ] {
+            assert!(summary.contains(label), "missing {label} from {summary}");
+        }
     }
 
     #[test]
@@ -4622,6 +6097,82 @@ mod tests {
         assert!(screen.contains("save"));
         assert!(screen.contains("Ctrl+P/N history"));
         insta::assert_snapshot!("command_palette", screen);
+    }
+
+    #[test]
+    fn populated_collections_manager_snapshot() {
+        let manager = populated_collections_manager();
+        let mut app = mock_app(Mode::Collections(Box::new(manager)));
+        let backend = TestBackend::new(110, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| render_modal(frame, &mut app))
+            .expect("draw collections manager");
+        let screen = buffer_text(&terminal);
+
+        assert!(screen.contains("Collections manager"));
+        assert!(screen.contains("Warm widescreen"));
+        assert!(screen.contains("exact match"));
+        assert!(screen.contains("wpaperd displays: DP-1"));
+        assert!(screen.contains("Minimum width: 2560 px"));
+        assert!(screen.contains("Enter load"));
+        assert!(screen.contains("● current filter"));
+        insta::assert_snapshot!("collections_manager_populated", screen);
+    }
+
+    #[test]
+    fn empty_collections_manager_snapshot() {
+        let manager = CollectionsManager {
+            collections: Vec::new(),
+            bindings: Vec::new(),
+            current_filter: FilterSpecV1::default(),
+            selected: 0,
+            focus: CollectionsFocus::List,
+            view: CollectionDetailView::Summary,
+            detail_scroll: 0,
+            detail_viewport_height: 1,
+            prompt: None,
+            error: None,
+            notice: None,
+        };
+        let mut app = mock_app(Mode::Collections(Box::new(manager)));
+        let backend = TestBackend::new(110, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| render_modal(frame, &mut app))
+            .expect("draw empty collections manager");
+        let screen = buffer_text(&terminal);
+
+        assert!(screen.contains("No saved collections"));
+        assert!(screen.contains("Press s to save the"));
+        assert!(screen.contains("current browser filter"));
+        insta::assert_snapshot!("collections_manager_empty", screen);
+    }
+
+    #[test]
+    fn collections_manager_confirmation_prompt_snapshot() {
+        let mut manager = populated_collections_manager();
+        manager.prompt = Some(CollectionPrompt::Confirm(Box::new(
+            CollectionConfirmation::Overwrite {
+                name: "warm widescreen".into(),
+                existing_name: "Warm widescreen".into(),
+            },
+        )));
+        let mut app = mock_app(Mode::Collections(Box::new(manager)));
+        let backend = TestBackend::new(110, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| render_modal(frame, &mut app))
+            .expect("draw collection confirmation");
+        let screen = buffer_text(&terminal);
+
+        assert!(screen.contains("Confirm overwrite"));
+        assert!(screen.contains("Warm widescreen already exists"));
+        assert!(screen.contains("Enter or y confirms"));
+        insta::assert_snapshot!("collections_manager_confirmation", screen);
     }
 
     #[test]
