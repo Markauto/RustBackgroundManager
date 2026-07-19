@@ -16,6 +16,7 @@ use uuid::Uuid;
 use crate::{
     AppPaths,
     db::{Database, ImageRecord, ImageStatus, path_bytes, path_from_bytes},
+    filesystem::{absolute_lexical, blake3_file},
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -67,7 +68,22 @@ pub fn plan_move(images: &[ImageRecord], destination_root: &Path) -> Result<Move
     if images.is_empty() {
         bail!("move selection is empty");
     }
-    if destination_root.exists() && !destination_root.is_dir() {
+    let destination_root = match destination_root.canonicalize() {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            absolute_lexical(destination_root)?
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "cannot resolve move destination {}",
+                    destination_root.display()
+                )
+            });
+        }
+    };
+    if optional_metadata(&destination_root)?.is_some_and(|metadata| !metadata.file_type().is_dir())
+    {
         bail!(
             "move destination is not a directory: {}",
             destination_root.display()
@@ -97,7 +113,7 @@ pub fn plan_move(images: &[ImageRecord], destination_root: &Path) -> Result<Move
         if !targets.insert(destination.clone()) {
             bail!("multiple selected files target {}", destination.display());
         }
-        if fs::symlink_metadata(&destination).is_ok() {
+        if optional_metadata(&destination)?.is_some() {
             bail!("destination already exists: {}", destination.display());
         }
         let hash = image
@@ -115,7 +131,7 @@ pub fn plan_move(images: &[ImageRecord], destination_root: &Path) -> Result<Move
     }
     Ok(MovePlan {
         id: Uuid::new_v4(),
-        destination_root: destination_root.to_owned(),
+        destination_root,
         items,
     })
 }
@@ -127,6 +143,18 @@ pub fn apply_move(database: &Database, paths: &AppPaths, mut plan: MovePlan) -> 
             plan.destination_root.display()
         )
     })?;
+    let live_destination_root = plan.destination_root.canonicalize().with_context(|| {
+        format!(
+            "cannot resolve move destination {}",
+            plan.destination_root.display()
+        )
+    })?;
+    anyhow::ensure!(
+        live_destination_root == plan.destination_root,
+        "move destination changed since planning: expected {}, found {}",
+        plan.destination_root.display(),
+        live_destination_root.display()
+    );
     validate_plan(&plan)?;
     insert_operation(database, &plan)?;
     let manifest = manifest_path(paths, plan.id);
@@ -143,24 +171,53 @@ pub fn apply_move(database: &Database, paths: &AppPaths, mut plan: MovePlan) -> 
             Ok(()) => {
                 plan.items[index].status = MoveItemStatus::Moved;
                 moved += 1;
-                update_moved_item(database, plan.id, index, &plan.items[index])?;
-                write_manifest(&manifest, &plan)?;
+                let manifest_result = write_manifest(&manifest, &plan);
+                let catalog_result =
+                    update_moved_item(database, plan.id, index, &plan.items[index]);
+                if let Some(error) = persistence_error(manifest_result, catalog_result) {
+                    let _ = update_item_status(
+                        database,
+                        plan.id,
+                        index,
+                        MoveItemStatus::Moved,
+                        Some(&error),
+                    );
+                    let _ = finish_operation(database, plan.id, "partial", Some(&error));
+                    bail!(
+                        "move {} stopped after {moved} file(s): the file moved but recovery state was incomplete: {error}; manifest: {}",
+                        plan.id,
+                        manifest.display()
+                    );
+                }
             }
             Err(error) => {
                 let message = format!("{error:#}");
                 plan.items[index].status = MoveItemStatus::Failed;
                 plan.items[index].error = Some(message.clone());
-                finish_operation(database, plan.id, "partial", Some(&message))?;
-                update_item_status(
+                let manifest_result = write_manifest(&manifest, &plan);
+                let item_result = update_item_status(
                     database,
                     plan.id,
                     index,
                     MoveItemStatus::Failed,
                     Some(&message),
-                )?;
-                write_manifest(&manifest, &plan)?;
+                );
+                let finish_result = finish_operation(database, plan.id, "partial", Some(&message));
+                let persistence = persistence_error(manifest_result, item_result)
+                    .into_iter()
+                    .chain(
+                        finish_result
+                            .err()
+                            .map(|error| format!("operation: {error:#}")),
+                    )
+                    .collect::<Vec<_>>();
+                let persistence = if persistence.is_empty() {
+                    String::new()
+                } else {
+                    format!("; recovery-state errors: {}", persistence.join("; "))
+                };
                 bail!(
-                    "move {} stopped after {moved} file(s): {message}; partial manifest: {}",
+                    "move {} stopped after {moved} file(s): {message}{persistence}; partial manifest: {}",
                     plan.id,
                     manifest.display()
                 );
@@ -178,58 +235,63 @@ pub fn apply_move(database: &Database, paths: &AppPaths, mut plan: MovePlan) -> 
 
 pub fn undo_move(database: &Database, paths: &AppPaths, operation_id: Uuid) -> Result<MoveResult> {
     let mut plan = load_operation(database, operation_id)?;
-    let moved_indices: Vec<_> = plan
+    let candidate_indices: Vec<_> = plan
         .items
         .iter()
         .enumerate()
-        .filter_map(|(index, item)| (item.status == MoveItemStatus::Moved).then_some(index))
+        .filter_map(|(index, item)| {
+            matches!(item.status, MoveItemStatus::Moved | MoveItemStatus::Undone).then_some(index)
+        })
         .collect();
-    if moved_indices.is_empty() {
+    if candidate_indices.is_empty() {
         bail!("move {operation_id} has no files that can be undone");
     }
-    for index in &moved_indices {
-        let item = &plan.items[*index];
-        if fs::symlink_metadata(&item.original_path).is_ok() {
-            bail!(
-                "cannot undo: original path exists: {}",
-                item.original_path.display()
-            );
-        }
-        let current = hash_file(&item.destination).with_context(|| {
-            format!(
-                "cannot undo: destination is unavailable: {}",
-                item.destination.display()
-            )
-        })?;
-        if current != item.hash {
-            bail!(
-                "cannot undo: destination hash changed: {}",
-                item.destination.display()
-            );
-        }
-    }
+    let candidates = candidate_indices
+        .into_iter()
+        .map(|index| undo_location(&plan.items[index]).map(|location| (index, location)))
+        .collect::<Result<Vec<_>>>()?;
 
     let manifest = manifest_path(paths, operation_id);
     let mut undone = 0;
-    for index in moved_indices.into_iter().rev() {
-        if let Some(parent) = plan.items[index].original_path.parent() {
-            fs::create_dir_all(parent)?;
+    for (index, location) in candidates.into_iter().rev() {
+        if location == UndoLocation::Destination {
+            if let Some(parent) = plan.items[index].original_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            move_one(
+                &plan.items[index].destination,
+                &plan.items[index].original_path,
+                &plan.items[index].hash,
+            )?;
         }
-        move_one(
-            &plan.items[index].destination,
-            &plan.items[index].original_path,
-            &plan.items[index].hash,
-        )?;
         plan.items[index].status = MoveItemStatus::Undone;
-        update_undone_item(database, operation_id, index, &plan.items[index])?;
-        write_manifest(&manifest, &plan)?;
         undone += 1;
+        let manifest_result = write_manifest(&manifest, &plan);
+        let catalog_result = update_undone_item(database, operation_id, index, &plan.items[index]);
+        if let Some(error) = persistence_error(manifest_result, catalog_result) {
+            let _ = update_item_status(
+                database,
+                operation_id,
+                index,
+                MoveItemStatus::Undone,
+                Some(&error),
+            );
+            let _ = finish_operation(database, operation_id, "partial", Some(&error));
+            bail!(
+                "undo {operation_id} stopped after {undone} file(s): the file was restored but recovery state was incomplete: {error}; manifest: {}",
+                manifest.display()
+            );
+        }
     }
     database.with_connection(|connection| {
-        connection.execute(
+        let changed = connection.execute(
             "UPDATE move_operations SET status='undone', undone_at=?1, error=NULL WHERE id=?2",
             params![Utc::now().timestamp_millis(), operation_id.to_string()],
         )?;
+        anyhow::ensure!(
+            changed == 1,
+            "move operation disappeared while finishing undo"
+        );
         Ok(())
     })?;
     Ok(MoveResult {
@@ -241,12 +303,21 @@ pub fn undo_move(database: &Database, paths: &AppPaths, operation_id: Uuid) -> R
 }
 
 fn validate_plan(plan: &MovePlan) -> Result<()> {
+    anyhow::ensure!(
+        plan.destination_root.is_absolute(),
+        "move destination root must be absolute"
+    );
     let mut destinations = HashSet::with_capacity(plan.items.len());
     for item in &plan.items {
+        anyhow::ensure!(
+            item.destination.parent() == Some(plan.destination_root.as_path()),
+            "move destination is outside the planned root: {}",
+            item.destination.display()
+        );
         if !destinations.insert(&item.destination) {
             bail!("duplicate destination: {}", item.destination.display());
         }
-        if fs::symlink_metadata(&item.destination).is_ok() {
+        if optional_metadata(&item.destination)?.is_some() {
             bail!("destination already exists: {}", item.destination.display());
         }
         let metadata = fs::symlink_metadata(&item.original_path)
@@ -257,7 +328,7 @@ fn validate_plan(plan: &MovePlan) -> Result<()> {
                 item.original_path.display()
             );
         }
-        let current = hash_file(&item.original_path)?;
+        let current = blake3_file(&item.original_path)?;
         if current != item.hash {
             bail!(
                 "source changed since scan: {}",
@@ -266,6 +337,82 @@ fn validate_plan(plan: &MovePlan) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn persistence_error(manifest: Result<()>, catalog: Result<()>) -> Option<String> {
+    let mut failures = Vec::new();
+    if let Err(error) = manifest {
+        failures.push(format!("manifest: {error:#}"));
+    }
+    if let Err(error) = catalog {
+        failures.push(format!("catalog: {error:#}"));
+    }
+    (!failures.is_empty()).then(|| failures.join("; "))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UndoLocation {
+    Destination,
+    Original,
+}
+
+fn undo_location(item: &MovePlanItem) -> Result<UndoLocation> {
+    let original = optional_metadata(&item.original_path)?;
+    let destination = optional_metadata(&item.destination)?;
+    let (location, path, description) = match (original, destination) {
+        (None, Some(metadata)) => (
+            UndoLocation::Destination,
+            &item.destination,
+            (metadata, "destination"),
+        ),
+        (Some(metadata), None) => (
+            UndoLocation::Original,
+            &item.original_path,
+            (metadata, "original"),
+        ),
+        (Some(_), Some(_)) => {
+            bail!(
+                "cannot undo: original and destination both exist: {} and {}",
+                item.original_path.display(),
+                item.destination.display()
+            );
+        }
+        (None, None) => {
+            bail!(
+                "cannot undo: original and destination are unavailable: {} and {}",
+                item.original_path.display(),
+                item.destination.display()
+            );
+        }
+    };
+    let (metadata, description) = description;
+    if !metadata.file_type().is_file() {
+        bail!(
+            "cannot undo: {description} is not a regular file: {}",
+            path.display()
+        );
+    }
+    let current = blake3_file(path).with_context(|| {
+        format!(
+            "cannot undo: {description} is unavailable: {}",
+            path.display()
+        )
+    })?;
+    if current != item.hash {
+        bail!(
+            "cannot undo: {description} hash changed: {}",
+            path.display()
+        );
+    }
+    Ok(location)
+}
+
+fn optional_metadata(path: &Path) -> Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("cannot inspect {}", path.display())),
+    }
 }
 
 fn move_one(source: &Path, destination: &Path, expected_hash: &str) -> Result<()> {
@@ -295,6 +442,17 @@ fn move_one(source: &Path, destination: &Path, expected_hash: &str) -> Result<()
 }
 
 fn copy_across_filesystems(source: &Path, destination: &Path, expected_hash: &str) -> Result<()> {
+    copy_across_filesystems_with_remove(source, destination, expected_hash, |path| {
+        fs::remove_file(path)
+    })
+}
+
+fn copy_across_filesystems_with_remove(
+    source: &Path,
+    destination: &Path,
+    expected_hash: &str,
+    remove_source: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<()> {
     let parent = destination.parent().context("destination has no parent")?;
     let source_file = File::open(source)?;
     let permissions = source_file.metadata()?.permissions();
@@ -307,7 +465,7 @@ fn copy_across_filesystems(source: &Path, destination: &Path, expected_hash: &st
     }
     temporary.as_file().set_permissions(permissions)?;
     temporary.as_file().sync_all()?;
-    let copied_hash = hash_file(temporary.path())?;
+    let copied_hash = blake3_file(temporary.path())?;
     if copied_hash != expected_hash {
         bail!("copied file failed hash verification");
     }
@@ -321,11 +479,15 @@ fn copy_across_filesystems(source: &Path, destination: &Path, expected_hash: &st
             )
         })?;
     sync_parent(destination)?;
-    if let Err(error) = fs::remove_file(source) {
-        let rollback = fs::remove_file(destination);
-        if let Err(rollback_error) = rollback {
+    if let Err(error) = remove_source(source) {
+        if let Err(rollback_error) = fs::remove_file(destination) {
             return Err(error).context(format!(
                 "could not delete source or roll back destination (rollback: {rollback_error})"
+            ));
+        }
+        if let Err(sync_error) = sync_parent(destination) {
+            return Err(error).context(format!(
+                "could not delete source; copied destination was removed but its directory could not be synced: {sync_error:#}"
             ));
         }
         return Err(error).context("could not delete source; copied destination was rolled back");
@@ -336,30 +498,31 @@ fn copy_across_filesystems(source: &Path, destination: &Path, expected_hash: &st
 
 fn insert_operation(database: &Database, plan: &MovePlan) -> Result<()> {
     database.with_transaction(|transaction| {
+        let operation_id = plan.id.to_string();
         transaction.execute(
             "INSERT INTO move_operations(id, status, destination_root, created_at)
              VALUES (?1, 'in_progress', ?2, ?3)",
             params![
-                plan.id.to_string(),
+                operation_id,
                 path_bytes(&plan.destination_root),
                 Utc::now().timestamp_millis(),
             ],
         )?;
+        let mut insert_item = transaction.prepare(
+            "INSERT INTO move_items(
+                operation_id, ordinal, image_id, original_path, destination, blake3, status
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )?;
         for (ordinal, item) in plan.items.iter().enumerate() {
-            transaction.execute(
-                "INSERT INTO move_items(
-                    operation_id, ordinal, image_id, original_path, destination, blake3, status
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    plan.id.to_string(),
-                    ordinal as i64,
-                    item.image_id,
-                    path_bytes(&item.original_path),
-                    path_bytes(&item.destination),
-                    item.hash,
-                    item.status.as_str(),
-                ],
-            )?;
+            insert_item.execute(params![
+                operation_id,
+                ordinal as i64,
+                item.image_id,
+                path_bytes(&item.original_path),
+                path_bytes(&item.destination),
+                item.hash,
+                item.status.as_str(),
+            ])?;
         }
         Ok(())
     })
@@ -372,14 +535,18 @@ fn update_moved_item(
     item: &MovePlanItem,
 ) -> Result<()> {
     database.with_transaction(|transaction| {
-        transaction.execute(
+        let item_changed = transaction.execute(
             "UPDATE move_items SET status='moved', error=NULL
              WHERE operation_id=?1 AND ordinal=?2",
             params![operation_id.to_string(), ordinal as i64],
         )?;
-        transaction.execute(
+        anyhow::ensure!(
+            item_changed == 1,
+            "move item disappeared while recording move"
+        );
+        let image_changed = transaction.execute(
             "UPDATE images SET path=?1, size=?2, modified_ns=?3, updated_at=?4
-             WHERE id=?5 AND path=?6",
+             WHERE id=?5 AND path IN (?6, ?7)",
             params![
                 path_bytes(&item.destination),
                 fs::metadata(&item.destination)?.len() as i64,
@@ -387,8 +554,13 @@ fn update_moved_item(
                 Utc::now().timestamp_millis(),
                 item.image_id,
                 path_bytes(&item.original_path),
+                path_bytes(&item.destination),
             ],
         )?;
+        anyhow::ensure!(
+            image_changed == 1,
+            "catalog image disappeared or changed path while recording move"
+        );
         Ok(())
     })
 }
@@ -400,14 +572,18 @@ fn update_undone_item(
     item: &MovePlanItem,
 ) -> Result<()> {
     database.with_transaction(|transaction| {
-        transaction.execute(
+        let item_changed = transaction.execute(
             "UPDATE move_items SET status='undone', error=NULL
              WHERE operation_id=?1 AND ordinal=?2",
             params![operation_id.to_string(), ordinal as i64],
         )?;
-        transaction.execute(
+        anyhow::ensure!(
+            item_changed == 1,
+            "move item disappeared while recording undo"
+        );
+        let image_changed = transaction.execute(
             "UPDATE images SET path=?1, size=?2, modified_ns=?3, updated_at=?4
-             WHERE id=?5 AND path=?6",
+             WHERE id=?5 AND path IN (?6, ?7)",
             params![
                 path_bytes(&item.original_path),
                 fs::metadata(&item.original_path)?.len() as i64,
@@ -415,8 +591,13 @@ fn update_undone_item(
                 Utc::now().timestamp_millis(),
                 item.image_id,
                 path_bytes(&item.destination),
+                path_bytes(&item.original_path),
             ],
         )?;
+        anyhow::ensure!(
+            image_changed == 1,
+            "catalog image disappeared or changed path while recording undo"
+        );
         Ok(())
     })
 }
@@ -429,7 +610,7 @@ fn update_item_status(
     error: Option<&str>,
 ) -> Result<()> {
     database.with_connection(|connection| {
-        connection.execute(
+        let changed = connection.execute(
             "UPDATE move_items SET status=?1, error=?2 WHERE operation_id=?3 AND ordinal=?4",
             params![
                 status.as_str(),
@@ -438,6 +619,7 @@ fn update_item_status(
                 ordinal as i64
             ],
         )?;
+        anyhow::ensure!(changed == 1, "move item disappeared while updating status");
         Ok(())
     })
 }
@@ -449,7 +631,7 @@ fn finish_operation(
     error: Option<&str>,
 ) -> Result<()> {
     database.with_connection(|connection| {
-        connection.execute(
+        let changed = connection.execute(
             "UPDATE move_operations SET status=?1, completed_at=?2, error=?3 WHERE id=?4",
             params![
                 status,
@@ -458,6 +640,10 @@ fn finish_operation(
                 operation_id.to_string(),
             ],
         )?;
+        anyhow::ensure!(
+            changed == 1,
+            "move operation disappeared while updating status"
+        );
         Ok(())
     })
 }
@@ -522,13 +708,6 @@ fn write_manifest(path: &Path, plan: &MovePlan) -> Result<()> {
     temporary.persist(path).map_err(|error| error.error)?;
     sync_parent(path)?;
     Ok(())
-}
-
-fn hash_file(path: &Path) -> Result<String> {
-    let mut reader = BufReader::new(File::open(path)?);
-    let mut hasher = blake3::Hasher::new();
-    std::io::copy(&mut reader, &mut hasher)?;
-    Ok(hasher.finalize().to_hex().to_string())
 }
 
 fn modified_ns(path: &Path) -> Result<i64> {
@@ -623,6 +802,179 @@ mod tests {
     }
 
     #[test]
+    fn manifest_and_undo_recover_from_a_catalog_update_failure() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let paths = AppPaths::from_xdg_roots(
+            directory.path().join("cfg"),
+            directory.path().join("data"),
+            directory.path().join("cache"),
+            directory.path().join("state"),
+        );
+        paths.ensure_owned_dirs().expect("dirs");
+        let source = directory.path().join("source");
+        let destination = directory.path().join("destination");
+        fs::create_dir(&source).expect("source");
+        fs::create_dir(&destination).expect("destination");
+        let original = source.join("wallpaper.png");
+        RgbImage::from_pixel(16, 8, Rgb([20, 40, 60]))
+            .save(&original)
+            .expect("image");
+        let original_bytes = fs::read(&original).expect("bytes");
+        let database = Database::open(&paths.database).expect("database");
+        database.add_source(&source).expect("source root");
+        scan_catalog(
+            &database,
+            &paths,
+            &Config::default(),
+            ScanOptions::default(),
+        )
+        .expect("scan");
+        let id = database
+            .image_id_by_path(&original)
+            .expect("lookup")
+            .expect("id");
+        let image = database.get_image(id).expect("load").expect("image");
+        let plan = plan_move(&[image], &destination).expect("plan");
+        let operation_id = plan.id;
+        database
+            .with_connection(|connection| {
+                connection.execute_batch(
+                    "CREATE TRIGGER reject_catalog_path_change
+                     BEFORE UPDATE OF path ON images
+                     WHEN NEW.path != OLD.path
+                     BEGIN
+                        SELECT RAISE(ABORT, 'injected catalog update failure');
+                     END;",
+                )?;
+                Ok(())
+            })
+            .expect("failure trigger");
+
+        let error = apply_move(&database, &paths, plan).expect_err("catalog update must fail");
+        assert!(format!("{error:#}").contains("file moved but recovery state was incomplete"));
+        let moved = destination.join("wallpaper.png");
+        assert!(!original.exists());
+        assert_eq!(fs::read(&moved).expect("moved bytes"), original_bytes);
+        let manifest: MovePlan = serde_json::from_slice(
+            &fs::read(manifest_path(&paths, operation_id)).expect("manifest"),
+        )
+        .expect("decode manifest");
+        assert_eq!(manifest.items[0].status, MoveItemStatus::Moved);
+        assert_eq!(
+            load_operation(&database, operation_id)
+                .expect("catalog operation")
+                .items[0]
+                .status,
+            MoveItemStatus::Moved
+        );
+
+        undo_move(&database, &paths, operation_id).expect("recovery undo");
+        assert_eq!(fs::read(&original).expect("restored bytes"), original_bytes);
+        assert!(!moved.exists());
+        assert_eq!(
+            database
+                .get_image(id)
+                .expect("catalog image")
+                .expect("image")
+                .path,
+            original
+        );
+    }
+
+    #[test]
+    fn retrying_undo_reconciles_an_already_restored_file() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let paths = AppPaths::from_xdg_roots(
+            directory.path().join("cfg"),
+            directory.path().join("data"),
+            directory.path().join("cache"),
+            directory.path().join("state"),
+        );
+        paths.ensure_owned_dirs().expect("dirs");
+        let source = directory.path().join("source");
+        let destination = directory.path().join("destination");
+        fs::create_dir(&source).expect("source");
+        fs::create_dir(&destination).expect("destination");
+        let original = source.join("wallpaper.png");
+        RgbImage::from_pixel(16, 8, Rgb([20, 40, 60]))
+            .save(&original)
+            .expect("image");
+        let original_bytes = fs::read(&original).expect("bytes");
+        let database = Database::open(&paths.database).expect("database");
+        database.add_source(&source).expect("source root");
+        scan_catalog(
+            &database,
+            &paths,
+            &Config::default(),
+            ScanOptions::default(),
+        )
+        .expect("scan");
+        let id = database
+            .image_id_by_path(&original)
+            .expect("lookup")
+            .expect("id");
+        let image = database.get_image(id).expect("load").expect("image");
+        let result = apply_move(
+            &database,
+            &paths,
+            plan_move(&[image], &destination).expect("plan"),
+        )
+        .expect("apply");
+        let moved = destination.join("wallpaper.png");
+        database
+            .with_connection(|connection| {
+                connection.execute_batch(
+                    "CREATE TRIGGER reject_catalog_path_change
+                     BEFORE UPDATE OF path ON images
+                     WHEN NEW.path != OLD.path
+                     BEGIN
+                        SELECT RAISE(ABORT, 'injected catalog update failure');
+                     END;",
+                )?;
+                Ok(())
+            })
+            .expect("failure trigger");
+
+        let error = undo_move(&database, &paths, result.id).expect_err("undo update must fail");
+        assert!(format!("{error:#}").contains("file was restored"));
+        assert_eq!(fs::read(&original).expect("restored bytes"), original_bytes);
+        assert!(!moved.exists());
+        assert_eq!(
+            database
+                .get_image(id)
+                .expect("catalog image")
+                .expect("image")
+                .path,
+            moved
+        );
+        assert_eq!(
+            load_operation(&database, result.id)
+                .expect("partial operation")
+                .items[0]
+                .status,
+            MoveItemStatus::Undone
+        );
+
+        database
+            .with_connection(|connection| {
+                connection.execute_batch("DROP TRIGGER reject_catalog_path_change")?;
+                Ok(())
+            })
+            .expect("remove failure trigger");
+        undo_move(&database, &paths, result.id).expect("retry undo");
+        assert_eq!(fs::read(&original).expect("final bytes"), original_bytes);
+        assert!(!moved.exists());
+        assert_eq!(
+            database
+                .get_image(id)
+                .expect("catalog image")
+                .expect("image")
+                .path,
+            original
+        );
+    }
+
+    #[test]
     fn rejects_collisions_before_any_move() {
         let image = ImageRecord {
             id: 1,
@@ -654,5 +1006,105 @@ mod tests {
         other.id = 2;
         other.path = PathBuf::from("/two/same.jpg");
         assert!(plan_move(&[image, other], Path::new("/destination")).is_err());
+    }
+
+    #[test]
+    fn relative_move_destination_is_stored_as_an_absolute_path() {
+        let mut image = ImageRecord {
+            id: 1,
+            source_id: 1,
+            path: PathBuf::from("/source/wallpaper.jpg"),
+            size: 1,
+            modified_ns: 0,
+            hash: Some("hash".into()),
+            status: ImageStatus::Ready,
+            error: None,
+            width: Some(1),
+            height: Some(1),
+            ratio: Some(1.0),
+            orientation: Some("square".into()),
+            common_ratio: Some("1:1".into()),
+            dominant_hex: None,
+            dominant_name: None,
+            luminance: None,
+            saturation: None,
+            contrast: None,
+            light_dark: None,
+            thumbnail_path: None,
+            palette: Vec::new(),
+            ai_estimates: Vec::new(),
+            favorite: false,
+            tags: Vec::new(),
+        };
+        let relative = PathBuf::from(format!("relative-destination-{}", Uuid::new_v4()));
+        let plan = plan_move(std::slice::from_ref(&image), &relative).expect("relative plan");
+        assert!(plan.destination_root.is_absolute());
+        assert!(plan.items[0].destination.is_absolute());
+        assert_eq!(
+            plan.items[0].destination.file_name(),
+            image.path.file_name()
+        );
+
+        image.path = plan.items[0].destination.clone();
+        assert!(plan_move(&[image], &plan.destination_root).is_err());
+    }
+
+    #[test]
+    fn validation_rejects_a_destination_outside_the_planned_root() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let source = directory.path().join("wallpaper.jpg");
+        let destination_root = directory.path().join("destination");
+        fs::write(&source, b"wallpaper bytes").expect("source file");
+        fs::create_dir(&destination_root).expect("destination root");
+        let plan = MovePlan {
+            id: Uuid::new_v4(),
+            destination_root,
+            items: vec![MovePlanItem {
+                image_id: 1,
+                original_path: source.clone(),
+                destination: directory.path().join("outside.jpg"),
+                hash: blake3_file(&source).expect("source hash"),
+                status: MoveItemStatus::Planned,
+                error: None,
+            }],
+        };
+
+        let error = validate_plan(&plan).expect_err("outside destination");
+        assert!(format!("{error:#}").contains("outside the planned root"));
+    }
+
+    #[test]
+    fn failed_cross_filesystem_source_removal_rolls_back_the_copy() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let source_directory = directory.path().join("source");
+        let destination_directory = directory.path().join("destination");
+        fs::create_dir(&source_directory).expect("source directory");
+        fs::create_dir(&destination_directory).expect("destination directory");
+        let source = source_directory.join("wallpaper.jpg");
+        let destination = destination_directory.join("wallpaper.jpg");
+        fs::write(&source, b"wallpaper bytes").expect("source file");
+        let hash = blake3_file(&source).expect("source hash");
+
+        let error = copy_across_filesystems_with_remove(&source, &destination, &hash, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected source removal failure",
+            ))
+        })
+        .expect_err("source removal must fail");
+
+        assert!(format!("{error:#}").contains("copied destination was rolled back"));
+        assert_eq!(
+            fs::read(&source).expect("source preserved"),
+            b"wallpaper bytes"
+        );
+        assert!(!destination.exists());
+        assert_eq!(
+            fs::read_dir(&destination_directory)
+                .expect("destination directory")
+                .count(),
+            0,
+            "the failed copy must not leave a temporary file"
+        );
     }
 }

@@ -4,7 +4,10 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
-use crate::model::{MODEL_ID, MODEL_REVISION};
+use crate::{
+    filesystem::resolve_file_target,
+    model::{MODEL_ID, MODEL_REVISION},
+};
 
 pub const CONFIG_VERSION: u32 = 1;
 
@@ -78,11 +81,16 @@ impl Default for AiConfig {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let text = fs::read_to_string(path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
+        let storage_path = resolve_file_target(path)?;
+        let text = match fs::read_to_string(&storage_path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to read {}", path.display()));
+            }
+        };
         Self::from_toml(&text)
     }
 
@@ -98,19 +106,27 @@ impl Config {
 
     pub fn save(&self, path: &Path) -> Result<()> {
         self.validate()?;
-        let parent = path
+        let storage_path = resolve_file_target(path)?;
+        let parent = storage_path
             .parent()
             .context("configuration path has no parent directory")?;
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
         let mut temporary = NamedTempFile::new_in(parent)
             .with_context(|| format!("failed to create temporary file in {}", parent.display()))?;
+        if let Ok(metadata) = fs::metadata(&storage_path)
+            && metadata.is_file()
+        {
+            temporary
+                .as_file()
+                .set_permissions(metadata.permissions())?;
+        }
         let text = toml::to_string_pretty(self).context("failed to serialize configuration")?;
         use std::io::Write as _;
         temporary.write_all(text.as_bytes())?;
         temporary.as_file().sync_all()?;
         temporary
-            .persist(path)
+            .persist(&storage_path)
             .map_err(|error| error.error)
             .with_context(|| format!("failed to replace {}", path.display()))?;
         sync_parent(parent)?;
@@ -274,5 +290,58 @@ mod tests {
         config.import.min_width = Some(2000);
         config.import.max_width = Some(1000);
         assert!(config.validate().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_save_preserves_a_config_symlink_and_file_mode() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let target = directory.path().join("real-config.toml");
+        let link = directory.path().join("config.toml");
+        Config::default().save(&target).expect("initial config");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640))
+            .expect("permissions");
+        symlink(&target, &link).expect("config symlink");
+        let mut changed = Config::default();
+        changed.ai.enabled = false;
+
+        changed.save(&link).expect("save through symlink");
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("link metadata")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(Config::load(&link).expect("load link"), changed);
+        assert_eq!(
+            std::fs::metadata(&target)
+                .expect("target metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_config_symlink_is_not_treated_as_an_absent_file() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let link = directory.path().join("config.toml");
+        symlink(directory.path().join("missing.toml"), &link).expect("dangling symlink");
+
+        assert!(Config::load(&link).is_err());
+        assert!(Config::default().save(&link).is_err());
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("link preserved")
+                .file_type()
+                .is_symlink()
+        );
     }
 }

@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use burn::{
@@ -16,7 +16,7 @@ use burn::{
 };
 use burn_store::pytorch::PytorchStore;
 use image::{DynamicImage, imageops::FilterType};
-use rusqlite::params;
+use rusqlite::{Transaction, params, params_from_iter, types::Value};
 use tokenizers::Tokenizer;
 
 use crate::{
@@ -33,6 +33,14 @@ const TEXT_WIDTH: usize = 512;
 const CONTEXT_LENGTH: usize = 77;
 const VOCAB_SIZE: usize = 49_408;
 const EOT_TOKEN: u32 = 49_407;
+// One model key plus 500 image IDs remains below SQLite's legacy 999-variable limit.
+const CANDIDATE_QUERY_BATCH_SIZE: usize = 500;
+const IMAGE_INFERENCE_BATCH_SIZE: usize = 8;
+const EMBEDDING_WRITE_BATCH_SIZE: usize = 32;
+const SCORE_WRITE_BATCH_SIZE: usize = 64;
+
+type PendingImage = (i64, PathBuf);
+type StoredEmbedding = (i64, Vec<u8>, usize);
 
 #[derive(Module, Debug)]
 struct ClipModel<B: burn::tensor::backend::Backend> {
@@ -287,12 +295,30 @@ impl ClipEngine {
     }
 
     fn image_embedding(&self, path: &Path) -> Result<Vec<f32>> {
-        let image = image::open(path)
-            .with_context(|| format!("failed to decode {} for CLIP", path.display()))?;
-        let values = preprocess_image(&image);
-        let tensor = Tensor::<Backend, 1>::from_floats(values.as_slice(), &self.device)
-            .reshape([1, 3, IMAGE_SIZE, IMAGE_SIZE]);
-        tensor_to_vector(self.model.encode_image(tensor))
+        self.image_embeddings(std::slice::from_ref(&path))?
+            .pop()
+            .context("CLIP returned no embedding for one image")
+    }
+
+    fn image_embeddings(&self, paths: &[&Path]) -> Result<Vec<Vec<f32>>> {
+        anyhow::ensure!(!paths.is_empty(), "CLIP image batch cannot be empty");
+        let values_per_image = 3 * IMAGE_SIZE * IMAGE_SIZE;
+        let mut values = Vec::with_capacity(paths.len() * values_per_image);
+        for path in paths {
+            let image = image::open(path)
+                .with_context(|| format!("failed to decode {} for CLIP", path.display()))?;
+            values.extend(preprocess_image(&image));
+        }
+        let tensor = Tensor::<Backend, 1>::from_floats(values.as_slice(), &self.device).reshape([
+            paths.len(),
+            3,
+            IMAGE_SIZE,
+            IMAGE_SIZE,
+        ]);
+        split_embedding_batch(
+            tensor_to_vector(self.model.encode_image(tensor))?,
+            paths.len(),
+        )
     }
 
     fn text_embedding(&self, text: &str) -> Result<Vec<f32>> {
@@ -319,35 +345,87 @@ impl ClipEngine {
 
 pub(super) fn analyze_missing(database: &Database, directory: &Path) -> Result<AiReport> {
     let key = model_key();
-    let pending = database.with_connection(|connection| {
-        let mut statement = connection.prepare(
-            "SELECT i.id, i.path FROM images i
-             WHERE i.status='ready' AND NOT EXISTS (
-                SELECT 1 FROM embeddings e WHERE e.image_id=i.id AND e.model_id=?1
-             ) ORDER BY i.path",
-        )?;
-        let rows = statement.query_map([&key], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                path_from_bytes(row.get_ref(1)?.as_blob()?),
-            ))
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
-    })?;
+    let pending = load_pending_images(database, &key, None)?;
     if pending.is_empty() {
         return Ok(AiReport::default());
     }
     let engine = ClipEngine::load(directory)?;
+    analyze_pending_with_engine(database, &engine, &key, pending)
+}
+
+fn analyze_pending_with_engine(
+    database: &Database,
+    engine: &ClipEngine,
+    key: &str,
+    pending: Vec<PendingImage>,
+) -> Result<AiReport> {
     let packs = list_label_packs(database)?;
-    let prepared = prepare_packs(&engine, &packs)?;
+    let prepared = prepare_packs(engine, &packs)?;
     let mut report = AiReport::default();
-    for (image_id, path) in pending {
-        match engine.image_embedding(&path) {
-            Ok(embedding) => {
-                store_embedding(database, image_id, &key, &embedding)?;
+    let mut completed = Vec::with_capacity(EMBEDDING_WRITE_BATCH_SIZE);
+    for batch in pending.chunks(IMAGE_INFERENCE_BATCH_SIZE) {
+        let paths = batch
+            .iter()
+            .map(|(_, path)| path.as_path())
+            .collect::<Vec<_>>();
+        match engine.image_embeddings(&paths) {
+            Ok(embeddings) => {
+                for ((image_id, path), embedding) in batch.iter().zip(embeddings) {
+                    completed.push((*image_id, path.clone(), embedding));
+                }
+            }
+            Err(_) => {
+                // A corrupt image or a batch-size-specific GPU failure should
+                // not prevent healthy images in the same batch from completing.
+                for (image_id, path) in batch {
+                    match engine.image_embedding(path) {
+                        Ok(embedding) => completed.push((*image_id, path.clone(), embedding)),
+                        Err(error) => {
+                            report.failed += 1;
+                            report
+                                .failures
+                                .push(format!("{}: {error:#}", path.display()));
+                        }
+                    }
+                }
+            }
+        }
+        if completed.len() >= EMBEDDING_WRITE_BATCH_SIZE {
+            persist_embedding_batch(database, key, &completed, &prepared, &mut report);
+            completed.clear();
+        }
+    }
+    persist_embedding_batch(database, key, &completed, &prepared, &mut report);
+    Ok(report)
+}
+
+fn persist_embedding_batch(
+    database: &Database,
+    key: &str,
+    embeddings: &[(i64, PathBuf, Vec<f32>)],
+    packs: &[PreparedPack],
+    report: &mut AiReport,
+) {
+    if embeddings.is_empty() {
+        return;
+    }
+    let batched = database.with_transaction(|transaction| {
+        for (image_id, _, embedding) in embeddings {
+            replace_embedding_and_scores(transaction, *image_id, key, embedding, packs)?;
+        }
+        Ok(())
+    });
+    if batched.is_ok() {
+        report.embedded += embeddings.len();
+        report.scored += embeddings.len();
+        return;
+    }
+
+    // Preserve per-image failure isolation if one record makes the batch roll back.
+    for (image_id, path, embedding) in embeddings {
+        match store_embedding_and_scores(database, *image_id, key, embedding, packs) {
+            Ok(()) => {
                 report.embedded += 1;
-                score_image(database, image_id, &embedding, &prepared)?;
                 report.scored += 1;
             }
             Err(error) => {
@@ -358,7 +436,62 @@ pub(super) fn analyze_missing(database: &Database, directory: &Path) -> Result<A
             }
         }
     }
-    Ok(report)
+}
+
+fn load_pending_images(
+    database: &Database,
+    key: &str,
+    image_ids: Option<&[i64]>,
+) -> Result<Vec<PendingImage>> {
+    let Some(image_ids) = image_ids else {
+        return database.with_connection(|connection| {
+            let sql = format!(
+                "SELECT i.id, i.path FROM images i
+                 WHERE i.status='ready' AND NOT EXISTS (
+                    SELECT 1 FROM embeddings e
+                    WHERE e.image_id=i.id AND e.model_id=?1 AND e.normalized=1
+                      AND e.dimension={EMBEDDING_DIMENSION}
+                      AND length(e.vector)={}
+                 ) ORDER BY i.path",
+                EMBEDDING_DIMENSION * 4
+            );
+            let mut statement = connection.prepare(&sql)?;
+            let rows = statement.query_map([key], pending_image_from_row)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        });
+    };
+    if image_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    database.with_connection(|connection| {
+        let mut pending = Vec::new();
+        for batch in image_ids.chunks(CANDIDATE_QUERY_BATCH_SIZE) {
+            let placeholders = vec!["?"; batch.len()].join(", ");
+            let sql = format!(
+                "SELECT i.id, i.path FROM images i
+                 WHERE i.status='ready' AND NOT EXISTS (
+                    SELECT 1 FROM embeddings e
+                    WHERE e.image_id=i.id AND e.model_id=? AND e.normalized=1
+                      AND e.dimension={EMBEDDING_DIMENSION}
+                      AND length(e.vector)={}
+                 ) AND i.id IN ({placeholders}) ORDER BY i.path",
+                EMBEDDING_DIMENSION * 4
+            );
+            let parameters = std::iter::once(Value::Text(key.to_owned()))
+                .chain(batch.iter().copied().map(Value::Integer));
+            let mut statement = connection.prepare(&sql)?;
+            let rows = statement.query_map(params_from_iter(parameters), pending_image_from_row)?;
+            pending.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+        }
+        pending.sort_by(|left, right| left.1.cmp(&right.1));
+        Ok(pending)
+    })
+}
+
+fn pending_image_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingImage> {
+    Ok((row.get(0)?, path_from_bytes(row.get_ref(1)?.as_blob()?)))
 }
 
 pub(super) fn probe_rocm() -> Result<String> {
@@ -378,33 +511,117 @@ pub(super) fn semantic_scores(
     directory: &Path,
     text: &str,
 ) -> Result<Vec<(i64, f32)>> {
+    semantic_scores_inner(database, directory, text, None)
+}
+
+pub(super) fn semantic_scores_for_images(
+    database: &Database,
+    directory: &Path,
+    text: &str,
+    image_ids: &[i64],
+) -> Result<Vec<(i64, f32)>> {
+    let text = validated_semantic_text(text)?;
+    let key = model_key();
+    let pending = load_pending_images(database, &key, Some(image_ids))?;
+    if pending.is_empty() {
+        return semantic_scores_inner(database, directory, text, Some(image_ids));
+    }
+
+    let engine = ClipEngine::load(directory)?;
+    let _ = analyze_pending_with_engine(database, &engine, &key, pending)?;
+    let embeddings = load_semantic_embeddings(database, &key, Some(image_ids))?;
+    score_semantic_embeddings(&engine, text, embeddings)
+}
+
+fn semantic_scores_inner(
+    database: &Database,
+    directory: &Path,
+    text: &str,
+    image_ids: Option<&[i64]>,
+) -> Result<Vec<(i64, f32)>> {
+    let text = validated_semantic_text(text)?;
+    let key = model_key();
+    let embeddings = load_semantic_embeddings(database, &key, image_ids)?;
+    if embeddings.is_empty() {
+        return Ok(Vec::new());
+    }
+    let engine = ClipEngine::load(directory)?;
+    score_semantic_embeddings(&engine, text, embeddings)
+}
+
+fn validated_semantic_text(text: &str) -> Result<&str> {
     let text = text.trim();
     if text.is_empty() {
         bail!("semantic search text cannot be empty");
     }
-    let engine = ClipEngine::load(directory)?;
+    Ok(text)
+}
+
+fn score_semantic_embeddings(
+    engine: &ClipEngine,
+    text: &str,
+    embeddings: Vec<StoredEmbedding>,
+) -> Result<Vec<(i64, f32)>> {
+    if embeddings.is_empty() {
+        return Ok(Vec::new());
+    }
     let query = engine.text_embedding(text)?;
-    let key = model_key();
-    let mut scored = database.with_connection(|connection| {
-        let mut statement = connection
-            .prepare("SELECT image_id, vector, dimension FROM embeddings WHERE model_id=?1")?;
-        let rows = statement.query_map([key], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, i64>(2)? as usize,
-            ))
-        })?;
-        let embeddings = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut scores = Vec::with_capacity(embeddings.len());
-        for (image_id, bytes, dimension) in embeddings {
-            let embedding = decode_embedding(&bytes, dimension)?;
-            scores.push((image_id, dot(&query, &embedding)));
-        }
-        Ok(scores)
-    })?;
+    let mut scored = Vec::with_capacity(embeddings.len());
+    for (image_id, bytes, dimension) in embeddings {
+        let embedding = decode_model_embedding(&bytes, dimension)?;
+        scored.push((image_id, dot(&query, &embedding)));
+    }
     scored.sort_by(|left, right| right.1.total_cmp(&left.1));
     Ok(scored)
+}
+
+fn load_semantic_embeddings(
+    database: &Database,
+    key: &str,
+    image_ids: Option<&[i64]>,
+) -> Result<Vec<StoredEmbedding>> {
+    let Some(image_ids) = image_ids else {
+        return database.with_connection(|connection| {
+            let sql = format!(
+                "SELECT image_id, vector, dimension FROM embeddings
+                 WHERE model_id=?1 AND normalized=1
+                   AND dimension={EMBEDDING_DIMENSION} AND length(vector)={}
+                 ORDER BY image_id",
+                EMBEDDING_DIMENSION * 4
+            );
+            let mut statement = connection.prepare(&sql)?;
+            let rows = statement.query_map([key], embedding_from_row)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        });
+    };
+    if image_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    database.with_connection(|connection| {
+        let mut embeddings = Vec::new();
+        for batch in image_ids.chunks(CANDIDATE_QUERY_BATCH_SIZE) {
+            let placeholders = vec!["?"; batch.len()].join(", ");
+            let sql = format!(
+                "SELECT image_id, vector, dimension FROM embeddings
+                 WHERE model_id=? AND normalized=1
+                   AND dimension={EMBEDDING_DIMENSION} AND length(vector)={}
+                   AND image_id IN ({placeholders}) ORDER BY image_id",
+                EMBEDDING_DIMENSION * 4
+            );
+            let parameters = std::iter::once(Value::Text(key.to_owned()))
+                .chain(batch.iter().copied().map(Value::Integer));
+            let mut statement = connection.prepare(&sql)?;
+            let rows = statement.query_map(params_from_iter(parameters), embedding_from_row)?;
+            embeddings.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+        }
+        Ok(embeddings)
+    })
+}
+
+fn embedding_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredEmbedding> {
+    Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? as usize))
 }
 
 struct PreparedPack {
@@ -445,28 +662,34 @@ fn score_image(
     embedding: &[f32],
     packs: &[PreparedPack],
 ) -> Result<()> {
-    database.with_transaction(|transaction| {
-        for pack in packs {
-            transaction.execute(
-                "DELETE FROM label_scores WHERE image_id=?1 AND pack_id=?2",
-                params![image_id, pack.id],
-            )?;
-            let logits: Vec<_> = pack
-                .labels
-                .iter()
-                .map(|(_, text)| dot(embedding, text) * 100.0)
-                .collect();
-            let probabilities = softmax(&logits);
-            for ((label, _), score) in pack.labels.iter().zip(probabilities) {
-                transaction.execute(
-                    "INSERT INTO label_scores(image_id, pack_id, label, score)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![image_id, pack.id, label, score],
-                )?;
-            }
+    database.with_transaction(|transaction| replace_scores(transaction, image_id, embedding, packs))
+}
+
+fn replace_scores(
+    transaction: &Transaction<'_>,
+    image_id: i64,
+    embedding: &[f32],
+    packs: &[PreparedPack],
+) -> Result<()> {
+    let mut delete_scores =
+        transaction.prepare_cached("DELETE FROM label_scores WHERE image_id=?1 AND pack_id=?2")?;
+    let mut insert_score = transaction.prepare_cached(
+        "INSERT INTO label_scores(image_id, pack_id, label, score)
+         VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    for pack in packs {
+        delete_scores.execute(params![image_id, pack.id])?;
+        let logits: Vec<_> = pack
+            .labels
+            .iter()
+            .map(|(_, text)| dot(embedding, text) * 100.0)
+            .collect();
+        let probabilities = softmax(&logits);
+        for ((label, _), score) in pack.labels.iter().zip(probabilities) {
+            insert_score.execute(params![image_id, pack.id, label, score])?;
         }
-        Ok(())
-    })
+    }
+    Ok(())
 }
 
 pub(super) fn rescore_label_packs(
@@ -484,26 +707,87 @@ pub(super) fn rescore_label_packs(
     let engine = ClipEngine::load(directory)?;
     let prepared = prepare_packs(&engine, &packs)?;
     let key = model_key();
-    let embeddings = database.with_connection(|connection| {
-        let mut statement = connection.prepare(
-            "SELECT image_id, vector, dimension FROM embeddings
-             WHERE model_id=?1 AND normalized=1 ORDER BY image_id",
-        )?;
-        let rows = statement.query_map([key], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, i64>(2)? as usize,
-            ))
-        })?;
+    let mut report = AiReport::default();
+    let mut after_image_id = None;
+    loop {
+        let embeddings = load_rescore_embedding_page(database, &key, after_image_id)?;
+        let Some((last_image_id, _, _)) = embeddings.last() else {
+            break;
+        };
+        after_image_id = Some(*last_image_id);
+        let mut pending = Vec::with_capacity(embeddings.len());
+        for (image_id, bytes, dimension) in embeddings {
+            match decode_model_embedding(&bytes, dimension) {
+                Ok(embedding) => pending.push((image_id, embedding)),
+                Err(error) => {
+                    report.failed += 1;
+                    report.failures.push(format!("image {image_id}: {error:#}"));
+                }
+            }
+        }
+        persist_score_batch(database, &pending, &prepared, &mut report);
+    }
+    Ok(report)
+}
+
+fn load_rescore_embedding_page(
+    database: &Database,
+    key: &str,
+    after_image_id: Option<i64>,
+) -> Result<Vec<StoredEmbedding>> {
+    database.with_connection(|connection| {
+        let (sql, parameters): (&str, Vec<Value>) = if let Some(image_id) = after_image_id {
+            (
+                "SELECT image_id, vector, dimension FROM embeddings
+                 WHERE model_id=?1 AND normalized=1 AND image_id>?2
+                 ORDER BY image_id LIMIT ?3",
+                vec![
+                    Value::Text(key.to_owned()),
+                    Value::Integer(image_id),
+                    Value::Integer(SCORE_WRITE_BATCH_SIZE as i64),
+                ],
+            )
+        } else {
+            (
+                "SELECT image_id, vector, dimension FROM embeddings
+                 WHERE model_id=?1 AND normalized=1
+                 ORDER BY image_id LIMIT ?2",
+                vec![
+                    Value::Text(key.to_owned()),
+                    Value::Integer(SCORE_WRITE_BATCH_SIZE as i64),
+                ],
+            )
+        };
+        let mut statement = connection.prepare(sql)?;
+        let rows = statement.query_map(params_from_iter(parameters), embedding_from_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
-    })?;
-    let mut report = AiReport::default();
-    for (image_id, bytes, dimension) in embeddings {
-        let result = decode_embedding(&bytes, dimension)
-            .and_then(|embedding| score_image(database, image_id, &embedding, &prepared));
-        match result {
+    })
+}
+
+fn persist_score_batch(
+    database: &Database,
+    embeddings: &[(i64, Vec<f32>)],
+    packs: &[PreparedPack],
+    report: &mut AiReport,
+) {
+    if embeddings.is_empty() {
+        return;
+    }
+    let batched = database.with_transaction(|transaction| {
+        for (image_id, embedding) in embeddings {
+            replace_scores(transaction, *image_id, embedding, packs)?;
+        }
+        Ok(())
+    });
+    if batched.is_ok() {
+        report.scored += embeddings.len();
+        return;
+    }
+
+    // Preserve per-image failure isolation if one record makes the batch roll back.
+    for (image_id, embedding) in embeddings {
+        match score_image(database, *image_id, embedding, packs) {
             Ok(()) => report.scored += 1,
             Err(error) => {
                 report.failed += 1;
@@ -511,34 +795,44 @@ pub(super) fn rescore_label_packs(
             }
         }
     }
-    Ok(report)
 }
 
-fn store_embedding(database: &Database, image_id: i64, key: &str, embedding: &[f32]) -> Result<()> {
-    if embedding.len() != EMBEDDING_DIMENSION {
-        bail!(
-            "CLIP returned {} dimensions, expected {EMBEDDING_DIMENSION}",
-            embedding.len()
-        );
-    }
+fn store_embedding_and_scores(
+    database: &Database,
+    image_id: i64,
+    key: &str,
+    embedding: &[f32],
+    packs: &[PreparedPack],
+) -> Result<()> {
+    database.with_transaction(|transaction| {
+        replace_embedding_and_scores(transaction, image_id, key, embedding, packs)
+    })
+}
+
+fn replace_embedding_and_scores(
+    transaction: &Transaction<'_>,
+    image_id: i64,
+    key: &str,
+    embedding: &[f32],
+    packs: &[PreparedPack],
+) -> Result<()> {
+    validate_model_embedding(embedding)?;
     let bytes = encode_embedding(embedding);
-    database.with_connection(|connection| {
-        connection.execute(
-            "INSERT INTO embeddings(image_id, model_id, dimension, vector, normalized, created_at)
+    transaction.execute(
+        "INSERT INTO embeddings(image_id, model_id, dimension, vector, normalized, created_at)
              VALUES (?1, ?2, ?3, ?4, 1, ?5)
              ON CONFLICT(image_id, model_id) DO UPDATE SET
                 dimension=excluded.dimension, vector=excluded.vector,
                 normalized=1, created_at=excluded.created_at",
-            params![
-                image_id,
-                key,
-                EMBEDDING_DIMENSION as i64,
-                bytes,
-                chrono::Utc::now().timestamp_millis(),
-            ],
-        )?;
-        Ok(())
-    })
+        params![
+            image_id,
+            key,
+            EMBEDDING_DIMENSION as i64,
+            bytes,
+            chrono::Utc::now().timestamp_millis(),
+        ],
+    )?;
+    replace_scores(transaction, image_id, embedding, packs)
 }
 
 fn preprocess_image(image: &DynamicImage) -> Vec<f32> {
@@ -571,6 +865,20 @@ fn tensor_to_vector(tensor: Tensor<Backend, 2>) -> Result<Vec<f32>> {
         .map_err(|error| anyhow::anyhow!("failed to read ROCm tensor: {error}"))
 }
 
+fn split_embedding_batch(values: Vec<f32>, batch_size: usize) -> Result<Vec<Vec<f32>>> {
+    anyhow::ensure!(batch_size != 0, "CLIP embedding batch cannot be empty");
+    anyhow::ensure!(
+        values.len() == batch_size * EMBEDDING_DIMENSION,
+        "CLIP returned {} values for a batch of {batch_size}; expected {}",
+        values.len(),
+        batch_size * EMBEDDING_DIMENSION
+    );
+    Ok(values
+        .chunks_exact(EMBEDDING_DIMENSION)
+        .map(<[f32]>::to_vec)
+        .collect())
+}
+
 fn encode_embedding(values: &[f32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(values.len() * 4);
     for value in values {
@@ -587,6 +895,32 @@ fn decode_embedding(bytes: &[u8], dimension: usize) -> Result<Vec<f32>> {
         .chunks_exact(4)
         .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect())
+}
+
+fn decode_model_embedding(bytes: &[u8], dimension: usize) -> Result<Vec<f32>> {
+    if dimension != EMBEDDING_DIMENSION {
+        bail!("stored CLIP embedding has {dimension} dimensions, expected {EMBEDDING_DIMENSION}");
+    }
+    let embedding = decode_embedding(bytes, dimension)?;
+    validate_model_embedding(&embedding)?;
+    Ok(embedding)
+}
+
+fn validate_model_embedding(embedding: &[f32]) -> Result<()> {
+    if embedding.len() != EMBEDDING_DIMENSION {
+        bail!(
+            "CLIP embedding has {} dimensions, expected {EMBEDDING_DIMENSION}",
+            embedding.len()
+        );
+    }
+    if embedding.iter().any(|value| !value.is_finite()) {
+        bail!("CLIP embedding contains a non-finite value");
+    }
+    let norm_squared = embedding.iter().map(|value| value * value).sum::<f32>();
+    if (norm_squared - 1.0).abs() > 0.01 {
+        bail!("CLIP embedding is not normalized (squared norm {norm_squared})");
+    }
+    Ok(())
 }
 
 fn dot(left: &[f32], right: &[f32]) -> f32 {
@@ -631,6 +965,11 @@ mod tests {
 
     use super::*;
 
+    fn unit_embedding() -> Vec<f32> {
+        let value = 1.0 / (EMBEDDING_DIMENSION as f32).sqrt();
+        vec![value; EMBEDDING_DIMENSION]
+    }
+
     #[test]
     fn embedding_blob_round_trips() {
         let input = vec![0.25, -0.5, 1.0];
@@ -638,6 +977,33 @@ mod tests {
             decode_embedding(&encode_embedding(&input), 3).expect("decode"),
             input
         );
+        assert!(decode_model_embedding(&encode_embedding(&input), 3).is_err());
+        assert!(
+            decode_model_embedding(
+                &encode_embedding(&vec![0.25; EMBEDDING_DIMENSION]),
+                EMBEDDING_DIMENSION,
+            )
+            .is_err()
+        );
+        let mut non_finite = unit_embedding();
+        non_finite[0] = f32::NAN;
+        assert!(
+            decode_model_embedding(&encode_embedding(&non_finite), EMBEDDING_DIMENSION).is_err()
+        );
+    }
+
+    #[test]
+    fn batched_embedding_output_is_split_by_image() {
+        let mut values = vec![0.0; EMBEDDING_DIMENSION * 2];
+        values[0] = 1.0;
+        values[EMBEDDING_DIMENSION] = 2.0;
+
+        let embeddings = split_embedding_batch(values, 2).expect("split batch");
+
+        assert_eq!(embeddings.len(), 2);
+        assert_eq!(embeddings[0][0], 1.0);
+        assert_eq!(embeddings[1][0], 2.0);
+        assert!(split_embedding_batch(vec![0.0; EMBEDDING_DIMENSION], 2).is_err());
     }
 
     #[test]
@@ -645,6 +1011,459 @@ mod tests {
         let scores = softmax(&[1.0, 3.0, 2.0]);
         assert!(scores[1] > scores[2] && scores[2] > scores[0]);
         assert!((scores.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn candidate_embedding_queries_are_scoped_and_batched() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = Database::open(directory.path().join("catalog.sqlite3")).expect("database");
+        let source_path = directory.path().join("images");
+        std::fs::create_dir(&source_path).expect("source directory");
+        let source = database.add_source(&source_path).expect("source");
+        let key = model_key();
+        let vector = encode_embedding(&unit_embedding());
+        let image_ids = database
+            .with_transaction(|transaction| {
+                let mut image_ids = Vec::new();
+                for index in 0..(CANDIDATE_QUERY_BATCH_SIZE + 2) {
+                    let image_path = source_path.join(format!("wallpaper-{index}.png"));
+                    transaction.execute(
+                        "INSERT INTO images(
+                            source_id, path, size, modified_ns, status, discovered_at, updated_at
+                         ) VALUES (?1, ?2, 0, 0, 'ready', 0, 0)",
+                        params![source.id, crate::db::path_bytes(&image_path)],
+                    )?;
+                    let image_id = transaction.last_insert_rowid();
+                    image_ids.push(image_id);
+                    transaction.execute(
+                        "INSERT INTO embeddings(
+                            image_id, model_id, dimension, vector, normalized, created_at
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+                        params![
+                            image_id,
+                            key,
+                            EMBEDDING_DIMENSION as i64,
+                            vector,
+                            i64::from(index < CANDIDATE_QUERY_BATCH_SIZE + 1),
+                        ],
+                    )?;
+                }
+                Ok(image_ids)
+            })
+            .expect("fixture data");
+
+        let requested = &image_ids[..CANDIDATE_QUERY_BATCH_SIZE + 1];
+        let embeddings = load_semantic_embeddings(&database, &key, Some(requested))
+            .expect("candidate embeddings");
+        assert_eq!(
+            embeddings
+                .iter()
+                .map(|(image_id, _, _)| *image_id)
+                .collect::<Vec<_>>(),
+            requested
+        );
+        let mut after_image_id = None;
+        let mut paged_count = 0;
+        loop {
+            let page = load_rescore_embedding_page(&database, &key, after_image_id)
+                .expect("rescore embedding page");
+            let Some((last_image_id, _, _)) = page.last() else {
+                break;
+            };
+            assert!(page.len() <= SCORE_WRITE_BATCH_SIZE);
+            after_image_id = Some(*last_image_id);
+            paged_count += page.len();
+        }
+        assert_eq!(paged_count, requested.len());
+        assert!(
+            load_pending_images(&database, &key, Some(requested))
+                .expect("embedded candidates")
+                .is_empty()
+        );
+
+        let unnormalized_id = *image_ids.last().expect("unnormalized image");
+        assert!(
+            load_semantic_embeddings(&database, &key, Some(&[unnormalized_id]))
+                .expect("unnormalized candidate")
+                .is_empty()
+        );
+        assert_eq!(
+            load_pending_images(&database, &key, Some(&[unnormalized_id]))
+                .expect("pending candidate"),
+            vec![(
+                unnormalized_id,
+                source_path.join(format!("wallpaper-{}.png", CANDIDATE_QUERY_BATCH_SIZE + 1)),
+            )]
+        );
+        database
+            .with_connection(|connection| {
+                connection.execute(
+                    "UPDATE embeddings SET normalized=1, dimension=1 WHERE image_id=?1",
+                    [unnormalized_id],
+                )?;
+                Ok(())
+            })
+            .expect("malformed embedding");
+        assert_eq!(
+            load_pending_images(&database, &key, Some(&[unnormalized_id]))
+                .expect("malformed candidate"),
+            vec![(
+                unnormalized_id,
+                source_path.join(format!("wallpaper-{}.png", CANDIDATE_QUERY_BATCH_SIZE + 1)),
+            )]
+        );
+        assert!(
+            load_semantic_embeddings(&database, &key, Some(&[unnormalized_id]))
+                .expect("malformed semantic embedding")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn embedding_analysis_persists_more_than_one_write_batch() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = Database::open(directory.path().join("catalog.sqlite3")).expect("database");
+        let source_path = directory.path().join("images");
+        std::fs::create_dir(&source_path).expect("source directory");
+        let source = database.add_source(&source_path).expect("source");
+        let (image_ids, pack_id) = database
+            .with_transaction(|transaction| {
+                let mut image_ids = Vec::new();
+                for index in 0..(EMBEDDING_WRITE_BATCH_SIZE + 1) {
+                    let image_path = source_path.join(format!("wallpaper-{index}.png"));
+                    transaction.execute(
+                        "INSERT INTO images(
+                            source_id, path, size, modified_ns, status, discovered_at, updated_at
+                         ) VALUES (?1, ?2, 0, 0, 'ready', 0, 0)",
+                        params![source.id, crate::db::path_bytes(&image_path)],
+                    )?;
+                    image_ids.push(transaction.last_insert_rowid());
+                }
+                let pack_id = transaction.query_row(
+                    "SELECT id FROM label_packs WHERE name='mood'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok((image_ids, pack_id))
+            })
+            .expect("fixture data");
+        let pack = PreparedPack {
+            id: pack_id,
+            labels: vec![("valid".into(), vec![0.5; EMBEDDING_DIMENSION])],
+        };
+        let embeddings = image_ids
+            .iter()
+            .map(|image_id| {
+                (
+                    *image_id,
+                    source_path.join(format!("wallpaper-{image_id}.png")),
+                    unit_embedding(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut report = AiReport::default();
+        for batch in embeddings.chunks(EMBEDDING_WRITE_BATCH_SIZE) {
+            persist_embedding_batch(
+                &database,
+                &model_key(),
+                batch,
+                std::slice::from_ref(&pack),
+                &mut report,
+            );
+        }
+
+        assert_eq!(report.embedded, EMBEDDING_WRITE_BATCH_SIZE + 1);
+        assert_eq!(report.scored, EMBEDDING_WRITE_BATCH_SIZE + 1);
+        assert_eq!(report.failed, 0);
+        let counts = database
+            .with_connection(|connection| {
+                connection
+                    .query_row(
+                        "SELECT
+                            (SELECT COUNT(*) FROM embeddings),
+                            (SELECT COUNT(*) FROM label_scores)",
+                        [],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                    )
+                    .map_err(Into::into)
+            })
+            .expect("stored counts");
+        assert_eq!(
+            counts,
+            (
+                (EMBEDDING_WRITE_BATCH_SIZE + 1) as i64,
+                (EMBEDDING_WRITE_BATCH_SIZE + 1) as i64,
+            )
+        );
+    }
+
+    #[test]
+    fn embedding_batch_falls_back_to_isolate_a_bad_image() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = Database::open(directory.path().join("catalog.sqlite3")).expect("database");
+        let source_path = directory.path().join("images");
+        std::fs::create_dir(&source_path).expect("source directory");
+        let source = database.add_source(&source_path).expect("source");
+        let (image_ids, pack_id) = database
+            .with_transaction(|transaction| {
+                let mut image_ids = Vec::new();
+                for index in 0..2 {
+                    let image_path = source_path.join(format!("wallpaper-{index}.png"));
+                    transaction.execute(
+                        "INSERT INTO images(
+                            source_id, path, size, modified_ns, status, discovered_at, updated_at
+                         ) VALUES (?1, ?2, 0, 0, 'ready', 0, 0)",
+                        params![source.id, crate::db::path_bytes(&image_path)],
+                    )?;
+                    image_ids.push(transaction.last_insert_rowid());
+                }
+                let pack_id = transaction.query_row(
+                    "SELECT id FROM label_packs WHERE name='mood'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok((image_ids, pack_id))
+            })
+            .expect("fixture data");
+        let embedding = unit_embedding();
+        let embeddings = vec![
+            (image_ids[0], PathBuf::from("first.png"), embedding.clone()),
+            (i64::MAX, PathBuf::from("invalid.png"), embedding.clone()),
+            (image_ids[1], PathBuf::from("second.png"), embedding),
+        ];
+        let pack = PreparedPack {
+            id: pack_id,
+            labels: vec![("valid".into(), vec![0.5; EMBEDDING_DIMENSION])],
+        };
+        let mut report = AiReport::default();
+
+        persist_embedding_batch(
+            &database,
+            &model_key(),
+            &embeddings,
+            std::slice::from_ref(&pack),
+            &mut report,
+        );
+
+        assert_eq!(report.embedded, 2);
+        assert_eq!(report.scored, 2);
+        assert_eq!(report.failed, 1);
+        assert!(report.failures[0].starts_with("invalid.png:"));
+        let stored = database
+            .with_connection(|connection| {
+                let mut statement =
+                    connection.prepare("SELECT image_id FROM embeddings ORDER BY image_id")?;
+                let rows = statement.query_map([], |row| row.get::<_, i64>(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(Into::into)
+            })
+            .expect("stored embeddings");
+        assert_eq!(stored, image_ids);
+    }
+
+    #[test]
+    fn label_rescoring_persists_more_than_one_write_batch() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = Database::open(directory.path().join("catalog.sqlite3")).expect("database");
+        let source_path = directory.path().join("images");
+        std::fs::create_dir(&source_path).expect("source directory");
+        let source = database.add_source(&source_path).expect("source");
+        let (image_ids, pack_id) = database
+            .with_transaction(|transaction| {
+                let mut image_ids = Vec::new();
+                for index in 0..(SCORE_WRITE_BATCH_SIZE + 1) {
+                    let image_path = source_path.join(format!("wallpaper-{index}.png"));
+                    transaction.execute(
+                        "INSERT INTO images(
+                            source_id, path, size, modified_ns, status, discovered_at, updated_at
+                         ) VALUES (?1, ?2, 0, 0, 'ready', 0, 0)",
+                        params![source.id, crate::db::path_bytes(&image_path)],
+                    )?;
+                    image_ids.push(transaction.last_insert_rowid());
+                }
+                let pack_id = transaction.query_row(
+                    "SELECT id FROM label_packs WHERE name='mood'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok((image_ids, pack_id))
+            })
+            .expect("fixture data");
+        let embedding = unit_embedding();
+        let pack = PreparedPack {
+            id: pack_id,
+            labels: vec![
+                ("first".into(), vec![0.5; EMBEDDING_DIMENSION]),
+                ("second".into(), vec![-0.5; EMBEDDING_DIMENSION]),
+            ],
+        };
+        let mut report = AiReport::default();
+        let embeddings = image_ids
+            .iter()
+            .map(|image_id| (*image_id, embedding.clone()))
+            .collect::<Vec<_>>();
+        for batch in embeddings.chunks(SCORE_WRITE_BATCH_SIZE) {
+            persist_score_batch(&database, batch, std::slice::from_ref(&pack), &mut report);
+        }
+
+        assert_eq!(report.scored, SCORE_WRITE_BATCH_SIZE + 1);
+        assert_eq!(report.failed, 0);
+        let score_count = database
+            .with_connection(|connection| {
+                connection
+                    .query_row("SELECT COUNT(*) FROM label_scores", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .map_err(Into::into)
+            })
+            .expect("score count");
+        assert_eq!(score_count, ((SCORE_WRITE_BATCH_SIZE + 1) * 2) as i64);
+    }
+
+    #[test]
+    fn label_rescoring_falls_back_to_isolate_a_bad_image() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = Database::open(directory.path().join("catalog.sqlite3")).expect("database");
+        let source_path = directory.path().join("images");
+        std::fs::create_dir(&source_path).expect("source directory");
+        let source = database.add_source(&source_path).expect("source");
+        let (image_ids, pack_id) = database
+            .with_transaction(|transaction| {
+                let mut image_ids = Vec::new();
+                for index in 0..2 {
+                    let image_path = source_path.join(format!("wallpaper-{index}.png"));
+                    transaction.execute(
+                        "INSERT INTO images(
+                            source_id, path, size, modified_ns, status, discovered_at, updated_at
+                         ) VALUES (?1, ?2, 0, 0, 'ready', 0, 0)",
+                        params![source.id, crate::db::path_bytes(&image_path)],
+                    )?;
+                    image_ids.push(transaction.last_insert_rowid());
+                }
+                let pack_id = transaction.query_row(
+                    "SELECT id FROM label_packs WHERE name='mood'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok((image_ids, pack_id))
+            })
+            .expect("fixture data");
+        let embedding = unit_embedding();
+        let embeddings = vec![
+            (image_ids[0], embedding.clone()),
+            (i64::MAX, embedding.clone()),
+            (image_ids[1], embedding),
+        ];
+        let pack = PreparedPack {
+            id: pack_id,
+            labels: vec![("valid".into(), vec![0.5; EMBEDDING_DIMENSION])],
+        };
+        let mut report = AiReport::default();
+
+        persist_score_batch(
+            &database,
+            &embeddings,
+            std::slice::from_ref(&pack),
+            &mut report,
+        );
+
+        assert_eq!(report.scored, 2);
+        assert_eq!(report.failed, 1);
+        assert!(report.failures[0].starts_with(&format!("image {}:", i64::MAX)));
+        let scored_images = database
+            .with_connection(|connection| {
+                let mut statement =
+                    connection.prepare("SELECT image_id FROM label_scores ORDER BY image_id")?;
+                let rows = statement.query_map([], |row| row.get::<_, i64>(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(Into::into)
+            })
+            .expect("scored images");
+        assert_eq!(scored_images, image_ids);
+    }
+
+    #[test]
+    fn embedding_and_scores_commit_atomically() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = Database::open(directory.path().join("catalog.sqlite3")).expect("database");
+        let source_path = directory.path().join("images");
+        std::fs::create_dir(&source_path).expect("source directory");
+        let source = database.add_source(&source_path).expect("source");
+        let image_path = source_path.join("wallpaper.png");
+        let (image_id, pack_id) = database
+            .with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO images(
+                        source_id, path, size, modified_ns, status, discovered_at, updated_at
+                     ) VALUES (?1, ?2, 0, 0, 'ready', 0, 0)",
+                    params![source.id, crate::db::path_bytes(&image_path)],
+                )?;
+                let image_id = connection.last_insert_rowid();
+                let pack_id = connection.query_row(
+                    "SELECT id FROM label_packs WHERE name='mood'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok((image_id, pack_id))
+            })
+            .expect("fixture data");
+        let embedding = unit_embedding();
+        let duplicate_labels = PreparedPack {
+            id: pack_id,
+            labels: vec![
+                ("duplicate".into(), vec![0.5; EMBEDDING_DIMENSION]),
+                ("duplicate".into(), vec![-0.5; EMBEDDING_DIMENSION]),
+            ],
+        };
+
+        assert!(
+            store_embedding_and_scores(
+                &database,
+                image_id,
+                &model_key(),
+                &embedding,
+                &[duplicate_labels],
+            )
+            .is_err()
+        );
+        let counts = database
+            .with_connection(|connection| {
+                connection
+                    .query_row(
+                        "SELECT
+                            (SELECT COUNT(*) FROM embeddings WHERE image_id=?1),
+                            (SELECT COUNT(*) FROM label_scores WHERE image_id=?1)",
+                        [image_id],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                    )
+                    .map_err(Into::into)
+            })
+            .expect("rollback counts");
+        assert_eq!(counts, (0, 0));
+
+        let valid_pack = PreparedPack {
+            id: pack_id,
+            labels: vec![
+                ("first".into(), vec![0.5; EMBEDDING_DIMENSION]),
+                ("second".into(), vec![-0.5; EMBEDDING_DIMENSION]),
+            ],
+        };
+        store_embedding_and_scores(&database, image_id, &model_key(), &embedding, &[valid_pack])
+            .expect("atomic store");
+        let counts = database
+            .with_connection(|connection| {
+                connection
+                    .query_row(
+                        "SELECT
+                            (SELECT COUNT(*) FROM embeddings WHERE image_id=?1),
+                            (SELECT COUNT(*) FROM label_scores WHERE image_id=?1)",
+                        [image_id],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                    )
+                    .map_err(Into::into)
+            })
+            .expect("stored counts");
+        assert_eq!(counts, (1, 2));
     }
 
     #[test]

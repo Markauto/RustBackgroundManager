@@ -117,13 +117,18 @@ pub fn analyze_image(
     path: &Path,
     config: &AnalysisConfig,
 ) -> Result<(ImageAnalysis, DynamicImage)> {
+    let image = decode_image(path)?;
+    let analysis = analyze_pixels(&image, config)?;
+    Ok((analysis, image))
+}
+
+pub fn decode_image(path: &Path) -> Result<DynamicImage> {
     let image = ImageReader::open(path)
         .with_context(|| format!("failed to open {}", path.display()))?
         .with_guessed_format()?
         .decode()
         .with_context(|| format!("failed to decode {}", path.display()))?;
-    let analysis = analyze_pixels(&image, config)?;
-    Ok((analysis, image))
+    Ok(image)
 }
 
 pub fn analyze_pixels(image: &DynamicImage, config: &AnalysisConfig) -> Result<ImageAnalysis> {

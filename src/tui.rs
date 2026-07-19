@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use crossbeam_channel::{Receiver, TryRecvError, unbounded};
+use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 use crossterm::{
     cursor::Show,
     event::{
@@ -43,7 +43,7 @@ use crate::{
     filter::{ColourFilter, FilterSpecV1},
     filter_completion::{FilterJsonCompletion, filter_json_completions},
     model,
-    move_files::{MovePlan, apply_move, plan_move},
+    move_files::{MovePlan, MoveResult, apply_move, plan_move},
     scan::{ScanEvent, ScanOptions, ScanReport, scan_catalog_with_progress},
     wpaperd,
 };
@@ -1195,6 +1195,7 @@ enum BackgroundResult {
     Finished {
         scan: ScanReport,
         ai: Option<model::AiReport>,
+        wpaperd_warning: Option<String>,
     },
     Failed(String),
 }
@@ -1208,6 +1209,66 @@ enum CommandBackgroundResult {
     Failed(String),
 }
 
+enum SemanticReloadResult {
+    Finished(Vec<ImageRecord>),
+    Failed(String),
+}
+
+enum WpaperdBackgroundResult {
+    Refreshed(Option<String>),
+    Bound(String),
+    Failed(String),
+}
+
+enum MoveBackgroundResult {
+    Finished(MoveResult),
+    Failed(String),
+}
+
+struct PreviewRequest {
+    image_id: i64,
+    path: PathBuf,
+}
+
+struct PreviewResult {
+    image_id: i64,
+    image: std::result::Result<image::DynamicImage, String>,
+}
+
+struct PreviewWorker {
+    request_sender: Sender<PreviewRequest>,
+    result_receiver: Receiver<PreviewResult>,
+}
+
+impl PreviewWorker {
+    fn new() -> Self {
+        let (request_sender, request_receiver) = unbounded::<PreviewRequest>();
+        let (result_sender, result_receiver) = unbounded();
+        thread::spawn(move || {
+            while let Ok(mut request) = request_receiver.recv() {
+                for queued in request_receiver.try_iter() {
+                    request = queued;
+                }
+                let image = image::open(&request.path)
+                    .map_err(|error| format!("failed to open {}: {error}", request.path.display()));
+                if result_sender
+                    .send(PreviewResult {
+                        image_id: request.image_id,
+                        image,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Self {
+            request_sender,
+            result_receiver,
+        }
+    }
+}
+
 struct App {
     images: Vec<ImageRecord>,
     selected: usize,
@@ -1217,9 +1278,19 @@ struct App {
     picker: Picker,
     preview: Option<StatefulProtocol>,
     preview_id: Option<i64>,
+    preview_requested_id: Option<i64>,
+    preview_worker: PreviewWorker,
     scan_receiver: Option<Receiver<BackgroundResult>>,
     scan_started: Option<Instant>,
     scan_total: Option<usize>,
+    semantic_receiver: Option<Receiver<SemanticReloadResult>>,
+    semantic_selected_id: Option<i64>,
+    semantic_previous_filter: Option<FilterSpecV1>,
+    semantic_started: Option<Instant>,
+    wpaperd_receiver: Option<Receiver<WpaperdBackgroundResult>>,
+    wpaperd_refresh_queued: bool,
+    move_receiver: Option<Receiver<MoveBackgroundResult>>,
+    move_started: Option<Instant>,
     command_receiver: Option<Receiver<CommandBackgroundResult>>,
     command_started: Option<Instant>,
     running_command: Option<String>,
@@ -1251,9 +1322,19 @@ impl App {
             picker,
             preview: None,
             preview_id: None,
+            preview_requested_id: None,
+            preview_worker: PreviewWorker::new(),
             scan_receiver: None,
             scan_started: None,
             scan_total: None,
+            semantic_receiver: None,
+            semantic_selected_id: None,
+            semantic_previous_filter: None,
+            semantic_started: None,
+            wpaperd_receiver: None,
+            wpaperd_refresh_queued: false,
+            move_receiver: None,
+            move_started: None,
             command_receiver: None,
             command_started: None,
             running_command: None,
@@ -1269,46 +1350,282 @@ impl App {
         self.images.get(self.selected)
     }
 
+    fn ensure_catalog_mutation_idle(&self) -> Result<()> {
+        if self.semantic_receiver.is_some() {
+            anyhow::bail!("wait for the semantic filter refresh before changing the catalog");
+        }
+        if self.scan_receiver.is_some() {
+            anyhow::bail!("wait for the background scan before changing the catalog");
+        }
+        if self.command_receiver.is_some() {
+            anyhow::bail!("wait for the background command before changing the catalog");
+        }
+        if self.move_receiver.is_some() {
+            anyhow::bail!("wait for the background move before changing the catalog");
+        }
+        if self.wpaperd_receiver.is_some() || self.wpaperd_refresh_queued {
+            anyhow::bail!("wait for the wpaperd worker before changing the catalog");
+        }
+        Ok(())
+    }
+
     fn reload(&mut self, database: &Database, paths: &AppPaths) -> Result<()> {
         let selected_id = self.selected().map(|image| image.id);
-        if self.filter.semantic_text.is_some() && !model::status(paths, false).verified {
-            anyhow::bail!(
-                "semantic TUI filters need the model installed first; run `bgm model install --yes`"
-            );
+        if self.semantic_receiver.is_some() {
+            anyhow::bail!("wait for the semantic filter refresh to finish");
         }
-        self.images = search_resolved(database, paths, &self.filter)?
+        if self.filter.semantic_text.is_some() {
+            if self.scan_receiver.is_some()
+                || self.command_receiver.is_some()
+                || self.wpaperd_receiver.is_some()
+                || self.move_receiver.is_some()
+            {
+                anyhow::bail!(
+                    "wait for the background scan or command before applying a semantic filter"
+                );
+            }
+            if !model::status(paths, false).verified {
+                anyhow::bail!(
+                    "semantic TUI filters need the model installed first; run `bgm model install --yes`"
+                );
+            }
+            let database_path = database.path().to_owned();
+            let paths = paths.clone();
+            let filter = self.filter.clone();
+            let (sender, receiver) = unbounded();
+            thread::spawn(move || {
+                let result = model::without_interactive_install(|| -> Result<Vec<ImageRecord>> {
+                    let database = Database::open(database_path)?;
+                    Ok(search_resolved(&database, &paths, &filter)?
+                        .into_iter()
+                        .map(|result| result.image)
+                        .collect())
+                })
+                .map(SemanticReloadResult::Finished)
+                .unwrap_or_else(|error| SemanticReloadResult::Failed(format!("{error:#}")));
+                let _ = sender.send(result);
+            });
+            self.semantic_receiver = Some(receiver);
+            self.semantic_selected_id = selected_id;
+            self.semantic_started = Some(Instant::now());
+            self.status = "Resolving semantic filter in background…".into();
+            return Ok(());
+        }
+        let images = search_resolved(database, paths, &self.filter)?
             .into_iter()
             .map(|result| result.image)
             .collect();
+        self.replace_images(images, selected_id);
+        Ok(())
+    }
+
+    fn replace_images(&mut self, images: Vec<ImageRecord>, selected_id: Option<i64>) {
+        self.images = images;
         self.selected = selected_id
             .and_then(|id| self.images.iter().position(|image| image.id == id))
             .unwrap_or(0)
             .min(self.images.len().saturating_sub(1));
         self.preview_id = None;
+        self.preview_requested_id = None;
         self.load_preview();
+    }
+
+    fn poll_semantic_reload(&mut self) {
+        let Some(receiver) = self.semantic_receiver.clone() else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(SemanticReloadResult::Finished(images)) => {
+                let selected_id = self.semantic_selected_id.take();
+                let elapsed = self
+                    .semantic_started
+                    .take()
+                    .map_or(0.0, |started| started.elapsed().as_secs_f32());
+                self.semantic_receiver = None;
+                self.semantic_previous_filter = None;
+                self.replace_images(images, selected_id);
+                self.status = format!(
+                    "Semantic filter refreshed in {elapsed:.1}s — {} result(s)",
+                    self.images.len()
+                );
+            }
+            Ok(SemanticReloadResult::Failed(error)) => {
+                if let Some(previous_filter) = self.semantic_previous_filter.take() {
+                    self.filter = previous_filter;
+                }
+                self.semantic_receiver = None;
+                self.semantic_selected_id = None;
+                self.semantic_started = None;
+                self.status = format!("Semantic filter failed: {error}");
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                if let Some(previous_filter) = self.semantic_previous_filter.take() {
+                    self.filter = previous_filter;
+                }
+                self.semantic_receiver = None;
+                self.semantic_selected_id = None;
+                self.semantic_started = None;
+                self.status = "Semantic filter worker stopped unexpectedly".into();
+            }
+        }
+    }
+
+    fn start_wpaperd_refresh(&mut self, database: &Database, paths: &AppPaths) {
+        if self.wpaperd_receiver.is_some()
+            || self.semantic_receiver.is_some()
+            || self.scan_receiver.is_some()
+            || self.command_receiver.is_some()
+            || self.move_receiver.is_some()
+        {
+            self.wpaperd_refresh_queued = true;
+            return;
+        }
+        let database_path = database.path().to_owned();
+        let paths = paths.clone();
+        let (sender, receiver) = unbounded();
+        thread::spawn(move || {
+            let result = match Database::open(database_path) {
+                Ok(database) => {
+                    WpaperdBackgroundResult::Refreshed(refresh_wpaperd_warning(&database, &paths))
+                }
+                Err(error) => WpaperdBackgroundResult::Failed(format!(
+                    "wpaperd refresh could not open the catalog: {error:#}"
+                )),
+            };
+            let _ = sender.send(result);
+        });
+        self.wpaperd_receiver = Some(receiver);
+    }
+
+    fn start_wpaperd_bind(
+        &mut self,
+        database: &Database,
+        paths: &AppPaths,
+        display: &str,
+        collection: &str,
+    ) -> Result<()> {
+        if self.wpaperd_receiver.is_some() || self.wpaperd_refresh_queued {
+            anyhow::bail!("wait for the wpaperd refresh to finish before binding a display");
+        }
+        if self.semantic_receiver.is_some()
+            || self.scan_receiver.is_some()
+            || self.command_receiver.is_some()
+            || self.move_receiver.is_some()
+        {
+            anyhow::bail!("wait for other background work before binding a display");
+        }
+        let database_path = database.path().to_owned();
+        let paths = paths.clone();
+        let display = display.to_owned();
+        let collection = collection.to_owned();
+        let pending_status = format!("Binding {display} to {collection} in background…");
+        let (sender, receiver) = unbounded();
+        thread::spawn(move || {
+            let result = model::without_interactive_install(|| -> Result<String> {
+                let database = Database::open(database_path)?;
+                let binding = wpaperd::bind(&database, &paths, &display, &collection)?;
+                Ok(format!(
+                    "Bound {} to {}",
+                    binding.display, binding.collection_name
+                ))
+            })
+            .map(WpaperdBackgroundResult::Bound)
+            .unwrap_or_else(|error| WpaperdBackgroundResult::Failed(format!("{error:#}")));
+            let _ = sender.send(result);
+        });
+        self.wpaperd_receiver = Some(receiver);
+        self.status = pending_status;
         Ok(())
+    }
+
+    fn poll_wpaperd(&mut self, database: &Database, paths: &AppPaths) {
+        let result =
+            self.wpaperd_receiver
+                .as_ref()
+                .and_then(|receiver| match receiver.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(TryRecvError::Empty) => None,
+                    Err(TryRecvError::Disconnected) => Some(WpaperdBackgroundResult::Failed(
+                        "wpaperd worker stopped unexpectedly".into(),
+                    )),
+                });
+        if let Some(result) = result {
+            self.wpaperd_receiver = None;
+            match result {
+                WpaperdBackgroundResult::Refreshed(warning) => {
+                    append_status_warning(&mut self.status, warning);
+                }
+                WpaperdBackgroundResult::Bound(status) => self.status = status,
+                WpaperdBackgroundResult::Failed(error) => {
+                    append_status_warning(&mut self.status, Some(error));
+                }
+            }
+        }
+        if self.wpaperd_receiver.is_none()
+            && self.wpaperd_refresh_queued
+            && self.semantic_receiver.is_none()
+            && self.scan_receiver.is_none()
+            && self.command_receiver.is_none()
+            && self.move_receiver.is_none()
+        {
+            self.wpaperd_refresh_queued = false;
+            self.start_wpaperd_refresh(database, paths);
+        }
     }
 
     fn load_preview(&mut self) {
         let Some(image) = self.selected() else {
             self.preview = None;
             self.preview_id = None;
+            self.preview_requested_id = None;
             return;
         };
-        if self.preview_id == Some(image.id) {
+        if self.preview_id == Some(image.id) || self.preview_requested_id == Some(image.id) {
             return;
         }
         let id = image.id;
         let path = image.thumbnail_path.as_ref().unwrap_or(&image.path).clone();
-        match image::open(&path) {
-            Ok(image) => {
-                self.preview = Some(self.picker.new_resize_protocol(image));
-                self.preview_id = Some(id);
-            }
-            Err(error) => {
-                self.preview = None;
-                self.preview_id = Some(id);
-                self.status = format!("Preview unavailable: {error}");
+        self.preview = None;
+        self.preview_id = None;
+        self.preview_requested_id = Some(id);
+        if self
+            .preview_worker
+            .request_sender
+            .send(PreviewRequest { image_id: id, path })
+            .is_err()
+        {
+            self.preview_requested_id = None;
+            self.preview_id = Some(id);
+            self.status = "Preview worker stopped unexpectedly".into();
+        }
+    }
+
+    fn poll_preview(&mut self) {
+        let receiver = self.preview_worker.result_receiver.clone();
+        loop {
+            match receiver.try_recv() {
+                Ok(result) if self.selected().map(|image| image.id) != Some(result.image_id) => {}
+                Ok(PreviewResult { image_id, image }) => {
+                    self.preview_requested_id = None;
+                    self.preview_id = Some(image_id);
+                    match image {
+                        Ok(image) => {
+                            self.preview = Some(self.picker.new_resize_protocol(image));
+                        }
+                        Err(error) => {
+                            self.preview = None;
+                            self.status = format!("Preview unavailable: {error}");
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if self.preview_requested_id.take().is_some() {
+                        self.status = "Preview worker stopped unexpectedly".into();
+                    }
+                    break;
+                }
             }
         }
     }
@@ -1327,6 +1644,22 @@ impl App {
     fn start_scan(&mut self, database: &Database, paths: &AppPaths, config: &Config) {
         if self.scan_receiver.is_some() {
             self.status = "A scan is already running".into();
+            return;
+        }
+        if self.semantic_receiver.is_some() {
+            self.status = "Wait for the semantic filter refresh before scanning".into();
+            return;
+        }
+        if self.wpaperd_receiver.is_some() {
+            self.status = "Wait for the wpaperd worker before scanning".into();
+            return;
+        }
+        if self.command_receiver.is_some() {
+            self.status = "Wait for the background command before scanning".into();
+            return;
+        }
+        if self.move_receiver.is_some() {
+            self.status = "Wait for the background move before scanning".into();
             return;
         }
         let database_path = database.path().to_owned();
@@ -1352,12 +1685,18 @@ impl App {
                     },
                 )?;
                 let ai = if config.ai.enabled && model::status(&paths, false).verified {
-                    Some(model::analyze_missing(&database, &paths)?)
+                    Some(model::without_interactive_install(|| {
+                        model::analyze_missing(&database, &paths)
+                    })?)
                 } else {
                     None
                 };
-                let _ = wpaperd::refresh(&database, &paths, None);
-                Ok(BackgroundResult::Finished { scan, ai })
+                let wpaperd_warning = refresh_wpaperd_warning(&database, &paths);
+                Ok(BackgroundResult::Finished {
+                    scan,
+                    ai,
+                    wpaperd_warning,
+                })
             })()
             .unwrap_or_else(|error| BackgroundResult::Failed(format!("{error:#}")));
             let _ = sender.send(result);
@@ -1392,7 +1731,11 @@ impl App {
                     );
                 }
                 Ok(BackgroundResult::Progress(ScanEvent::Finished(_))) => {}
-                Ok(BackgroundResult::Finished { scan, ai }) => {
+                Ok(BackgroundResult::Finished {
+                    scan,
+                    ai,
+                    wpaperd_warning,
+                }) => {
                     let elapsed = self
                         .scan_started
                         .map_or(0.0, |start| start.elapsed().as_secs_f32());
@@ -1412,6 +1755,7 @@ impl App {
                             failure.error
                         ));
                     }
+                    append_status_warning(&mut self.status, wpaperd_warning);
                     self.scan_receiver = None;
                     self.scan_started = None;
                     self.scan_total = None;
@@ -1452,8 +1796,20 @@ impl App {
         if self.scan_receiver.is_some() {
             anyhow::bail!("wait for the background scan to finish before running a command");
         }
+        if self.semantic_receiver.is_some() {
+            anyhow::bail!("wait for the semantic filter refresh before running a command");
+        }
+        if self.wpaperd_receiver.is_some() {
+            anyhow::bail!("wait for the wpaperd worker before running a command");
+        }
+        if self.wpaperd_refresh_queued {
+            anyhow::bail!("wait for the queued wpaperd refresh before running a command");
+        }
         if self.command_receiver.is_some() {
             anyhow::bail!("another command is already running");
+        }
+        if self.move_receiver.is_some() {
+            anyhow::bail!("wait for the background move before running a command");
         }
         let executable = std::env::current_exe().context("failed to locate the bgm executable")?;
         let (sender, receiver) = unbounded();
@@ -1585,6 +1941,76 @@ impl App {
                 .push_str(" — output will open after the current dialog");
         }
     }
+
+    fn start_move(&mut self, database: &Database, paths: &AppPaths, plan: MovePlan) -> Result<()> {
+        self.ensure_catalog_mutation_idle()?;
+        let operation_id = plan.id;
+        let database_path = database.path().to_owned();
+        let paths = paths.clone();
+        let (sender, receiver) = unbounded();
+        thread::spawn(move || {
+            let result = Database::open(database_path)
+                .and_then(|database| apply_move(&database, &paths, plan))
+                .map(MoveBackgroundResult::Finished)
+                .unwrap_or_else(|error| MoveBackgroundResult::Failed(format!("{error:#}")));
+            let _ = sender.send(result);
+        });
+        self.move_receiver = Some(receiver);
+        self.move_started = Some(Instant::now());
+        self.status = format!("Moving files in background — operation {operation_id}…");
+        Ok(())
+    }
+
+    fn poll_move(&mut self, database: &Database, paths: &AppPaths) {
+        let Some(receiver) = self.move_receiver.clone() else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(MoveBackgroundResult::Finished(result)) => {
+                let elapsed = self
+                    .move_started
+                    .take()
+                    .map_or(0.0, |started| started.elapsed().as_secs_f32());
+                self.move_receiver = None;
+                if let Err(error) = self.reload(database, paths) {
+                    self.status = format!(
+                        "Moved {} file(s) in {elapsed:.1}s; TUI refresh failed: {error:#}; undo ID {}",
+                        result.moved, result.id
+                    );
+                } else {
+                    self.status = format!(
+                        "Moved {} file(s) in {elapsed:.1}s; undo ID {}",
+                        result.moved, result.id
+                    );
+                }
+                self.start_wpaperd_refresh(database, paths);
+            }
+            Ok(MoveBackgroundResult::Failed(error)) => {
+                self.move_receiver = None;
+                self.move_started = None;
+                self.status = format!("Background move failed: {error}");
+                if let Err(reload_error) = self.reload(database, paths) {
+                    self.status
+                        .push_str(&format!(" — TUI refresh failed: {reload_error:#}"));
+                }
+                self.start_wpaperd_refresh(database, paths);
+            }
+            Err(TryRecvError::Empty) => {
+                if let Some(started) = self.move_started {
+                    self.status = format!(
+                        "Moving files in background… {:.1}s",
+                        started.elapsed().as_secs_f32()
+                    );
+                }
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.move_receiver = None;
+                self.move_started = None;
+                self.status =
+                    "Background move stopped unexpectedly; inspect `bgm move undo` state".into();
+            }
+        }
+    }
 }
 
 fn append_command_note(output: &mut String, note: &str) {
@@ -1654,7 +2080,11 @@ fn run_loop(
         if let Err(error) = app.poll_scan(database, paths) {
             app.status = format!("Background result error: {error:#}");
         }
+        app.poll_semantic_reload();
+        app.poll_move(database, paths);
+        app.poll_wpaperd(database, paths);
         app.poll_command(database, paths, config);
+        app.poll_preview();
         terminal.draw(|frame| draw(frame, app))?;
         if event::poll(Duration::from_millis(100))? {
             let result = match event::read()? {
@@ -1742,10 +2172,7 @@ fn handle_key(
             KeyCode::Char('y' | 'Y') => {
                 let plan = plan.clone();
                 app.mode = Mode::Browse;
-                let result = apply_move(database, paths, plan)?;
-                app.status = format!("Moved {} file(s); undo ID {}", result.moved, result.id);
-                let _ = wpaperd::refresh(database, paths, None);
-                app.reload(database, paths)
+                app.start_move(database, paths, plan)
             }
             KeyCode::Char('n' | 'N') | KeyCode::Esc => {
                 app.mode = Mode::Browse;
@@ -1824,6 +2251,7 @@ fn handle_filter_editor_key(
             }
         }
         FilterEditorCommand::SavePreset(name) => {
+            app.ensure_catalog_mutation_idle()?;
             let value = match &app.mode {
                 Mode::FilterEditor(editor) => editor.value(),
                 _ => return Ok(()),
@@ -1836,7 +2264,6 @@ fn handle_filter_editor_key(
             })();
             match result {
                 Ok((saved, presets)) => {
-                    let _ = wpaperd::refresh(database, paths, None);
                     if let Mode::FilterEditor(editor) = &mut app.mode {
                         editor.refresh_saved_presets(presets, &saved.name);
                         editor.focus = FilterEditorFocus::Presets;
@@ -1844,6 +2271,7 @@ fn handle_filter_editor_key(
                         editor.error = None;
                     }
                     app.status = format!("Saved filter preset {}", saved.name);
+                    app.start_wpaperd_refresh(database, paths);
                 }
                 Err(error) => {
                     if let Mode::FilterEditor(editor) = &mut app.mode {
@@ -1894,7 +2322,13 @@ fn handle_browse_key(
     config: &Config,
 ) -> Result<()> {
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
+        KeyCode::Char('q') | KeyCode::Esc => {
+            if app.move_receiver.is_some() {
+                app.status = "Wait for the background move to finish before quitting".into();
+            } else {
+                app.should_quit = true;
+            }
+        }
         KeyCode::Down | KeyCode::Char('j') => app.move_selection(1),
         KeyCode::Up | KeyCode::Char('k') => app.move_selection(-1),
         KeyCode::PageDown => app.move_selection(10),
@@ -1947,15 +2381,16 @@ fn handle_browse_key(
         }
         KeyCode::Char('f') => {
             if let Some(image) = app.selected() {
+                app.ensure_catalog_mutation_idle()?;
                 let (id, favorite) = (image.id, !image.favorite);
                 set_favorite(database, &[id], favorite)?;
-                let _ = wpaperd::refresh(database, paths, None);
                 app.reload(database, paths)?;
                 app.status = if favorite {
                     "Marked favorite".into()
                 } else {
                     "Removed favorite".into()
                 };
+                app.start_wpaperd_refresh(database, paths);
             }
         }
         KeyCode::Char('o') | KeyCode::Enter => {
@@ -1990,10 +2425,11 @@ fn submit_input(
             if !value.is_empty()
                 && let Some(image) = app.selected()
             {
+                app.ensure_catalog_mutation_idle()?;
                 add_tag(database, &[image.id], &value)?;
-                let _ = wpaperd::refresh(database, paths, None);
                 app.reload(database, paths)?;
                 app.status = format!("Added tag {value}");
+                app.start_wpaperd_refresh(database, paths);
             }
         }
         InputAction::Collection => {
@@ -2008,24 +2444,34 @@ fn submit_input(
                     format!("Collections: {}", names.join(", "))
                 };
             } else if let Some(name) = value.strip_prefix("load ").map(str::trim) {
+                app.ensure_catalog_mutation_idle()?;
                 let collection = get_collection(database, name)?
                     .with_context(|| format!("collection not found: {name}"))?;
-                app.filter = collection.filter;
-                app.reload(database, paths)?;
-                app.status = format!("Loaded collection {}", collection.name);
+                let previous_filter = std::mem::replace(&mut app.filter, collection.filter);
+                if let Err(error) = app.reload(database, paths) {
+                    app.filter = previous_filter;
+                    return Err(error);
+                }
+                if app.semantic_receiver.is_some() {
+                    app.semantic_previous_filter = Some(previous_filter);
+                } else {
+                    app.status = format!("Loaded collection {}", collection.name);
+                }
             } else if let Some(name) = value.strip_prefix("delete ").map(str::trim) {
+                app.ensure_catalog_mutation_idle()?;
                 if !delete_collection(database, name)? {
                     anyhow::bail!("collection not found: {name}");
                 }
-                let _ = wpaperd::refresh(database, paths, None);
                 app.status = format!("Deleted collection {name}");
+                app.start_wpaperd_refresh(database, paths);
             } else if !value.is_empty() {
+                app.ensure_catalog_mutation_idle()?;
                 let name = value
                     .strip_prefix("save ")
                     .map_or(value.as_str(), str::trim);
                 let collection = save_collection(database, name, &app.filter)?;
-                let _ = wpaperd::refresh(database, paths, None);
                 app.status = format!("Saved collection {}", collection.name);
+                app.start_wpaperd_refresh(database, paths);
             }
         }
         InputAction::Move => {
@@ -2038,6 +2484,7 @@ fn submit_input(
         }
         InputAction::Bind => {
             if let Some(display) = value.strip_prefix("unbind ").map(str::trim) {
+                app.ensure_catalog_mutation_idle()?;
                 let result = wpaperd::unbind(database, paths, display)?;
                 app.status = if result.restored {
                     format!("Unbound {display} and restored its previous path")
@@ -2048,15 +2495,31 @@ fn submit_input(
                 let (display, collection) = value
                     .split_once(char::is_whitespace)
                     .context("binding input must be DISPLAY COLLECTION or `unbind DISPLAY`")?;
-                let binding = wpaperd::bind(database, paths, display, collection.trim())?;
-                app.status = format!("Bound {} to {}", binding.display, binding.collection_name);
+                app.start_wpaperd_bind(database, paths, display, collection.trim())?;
             }
         }
     }
     Ok(())
 }
 
+fn refresh_wpaperd_warning(database: &Database, paths: &AppPaths) -> Option<String> {
+    match model::without_interactive_install(|| wpaperd::refresh(database, paths, None)) {
+        Ok(report) => report
+            .failure_summary()
+            .map(|failures| format!("wpaperd refresh warning: {failures}")),
+        Err(error) => Some(format!("wpaperd refresh failed: {error:#}")),
+    }
+}
+
+fn append_status_warning(status: &mut String, warning: Option<String>) {
+    if let Some(warning) = warning {
+        status.push_str(" — ");
+        status.push_str(&warning);
+    }
+}
+
 fn apply_filter(app: &mut App, value: &str, database: &Database, paths: &AppPaths) -> Result<()> {
+    app.ensure_catalog_mutation_idle()?;
     let filter = parse_filter(value)?;
 
     let previous_filter = std::mem::replace(&mut app.filter, filter);
@@ -2064,7 +2527,11 @@ fn apply_filter(app: &mut App, value: &str, database: &Database, paths: &AppPath
         app.filter = previous_filter;
         return Err(error);
     }
-    app.status = format!("Filter applied — {} result(s)", app.images.len());
+    if app.semantic_receiver.is_some() {
+        app.semantic_previous_filter = Some(previous_filter);
+    } else {
+        app.status = format!("Filter applied — {} result(s)", app.images.len());
+    }
     Ok(())
 }
 
@@ -2965,9 +3432,19 @@ mod tests {
             picker: Picker::halfblocks(),
             preview: None,
             preview_id: None,
+            preview_requested_id: None,
+            preview_worker: PreviewWorker::new(),
             scan_receiver: None,
             scan_started: None,
             scan_total: None,
+            semantic_receiver: None,
+            semantic_selected_id: None,
+            semantic_previous_filter: None,
+            semantic_started: None,
+            wpaperd_receiver: None,
+            wpaperd_refresh_queued: false,
+            move_receiver: None,
+            move_started: None,
             command_receiver: None,
             command_started: None,
             running_command: None,
@@ -2975,6 +3452,167 @@ mod tests {
             pending_command_output: None,
             should_quit: false,
         }
+    }
+
+    #[test]
+    fn semantic_reload_applies_results_and_restores_a_failed_filter() {
+        let mut app = mock_app(Mode::Browse);
+        let selected_id = app.images[0].id;
+        let mut other = app.images[0].clone();
+        other.id += 1;
+        other.path = PathBuf::from("/wallpapers/other.png");
+        let (sender, receiver) = unbounded();
+        app.semantic_receiver = Some(receiver);
+        app.semantic_selected_id = Some(selected_id);
+        app.semantic_started = Some(Instant::now());
+        sender
+            .send(SemanticReloadResult::Finished(vec![
+                other,
+                app.images[0].clone(),
+            ]))
+            .expect("semantic result");
+
+        app.poll_semantic_reload();
+
+        assert_eq!(app.images.len(), 2);
+        assert_eq!(app.selected, 1);
+        assert!(app.semantic_receiver.is_none());
+        assert!(app.status.starts_with("Semantic filter refreshed"));
+
+        let previous_filter = app.filter.clone();
+        app.filter.semantic_text = Some("mountains".into());
+        let (sender, receiver) = unbounded();
+        app.semantic_receiver = Some(receiver);
+        app.semantic_previous_filter = Some(previous_filter.clone());
+        sender
+            .send(SemanticReloadResult::Failed("GPU unavailable".into()))
+            .expect("semantic failure");
+
+        app.poll_semantic_reload();
+
+        assert_eq!(app.filter, previous_filter);
+        assert!(app.semantic_receiver.is_none());
+        assert_eq!(app.status, "Semantic filter failed: GPU unavailable");
+    }
+
+    #[test]
+    fn preview_worker_results_cannot_replace_the_current_selection() {
+        let mut app = mock_app(Mode::Browse);
+        let selected_id = app.images[0].id;
+        let (request_sender, _request_receiver) = unbounded();
+        let (result_sender, result_receiver) = unbounded();
+        app.preview_worker = PreviewWorker {
+            request_sender,
+            result_receiver,
+        };
+        app.preview_requested_id = Some(selected_id);
+
+        result_sender
+            .send(PreviewResult {
+                image_id: selected_id + 1,
+                image: Err("stale failure".into()),
+            })
+            .expect("stale result");
+        app.poll_preview();
+        assert_eq!(app.preview_requested_id, Some(selected_id));
+        assert_eq!(app.status, "Ready — ? for help");
+
+        result_sender
+            .send(PreviewResult {
+                image_id: selected_id,
+                image: Err("selected failure".into()),
+            })
+            .expect("selected result");
+        app.poll_preview();
+        assert_eq!(app.preview_requested_id, None);
+        assert_eq!(app.preview_id, Some(selected_id));
+        assert_eq!(app.status, "Preview unavailable: selected failure");
+    }
+
+    #[test]
+    fn wpaperd_worker_coalesces_refreshes_and_reports_bind_completion() {
+        let (directory, paths, database, mut app) = empty_runtime();
+        let (sender, receiver) = unbounded();
+        app.wpaperd_receiver = Some(receiver);
+        app.start_wpaperd_refresh(&database, &paths);
+        assert!(app.wpaperd_refresh_queued);
+        let (_semantic_sender, semantic_receiver) = unbounded();
+        app.semantic_receiver = Some(semantic_receiver);
+        sender
+            .send(WpaperdBackgroundResult::Refreshed(None))
+            .expect("refresh result");
+
+        app.poll_wpaperd(&database, &paths);
+
+        assert!(app.wpaperd_receiver.is_none());
+        assert!(app.wpaperd_refresh_queued);
+
+        app.semantic_receiver = None;
+        app.wpaperd_refresh_queued = false;
+        let (sender, receiver) = unbounded();
+        app.wpaperd_receiver = Some(receiver);
+        sender
+            .send(WpaperdBackgroundResult::Bound("Bound DP-1 to all".into()))
+            .expect("bind result");
+
+        app.poll_wpaperd(&database, &paths);
+
+        assert_eq!(app.status, "Bound DP-1 to all");
+        drop(directory);
+    }
+
+    #[test]
+    fn background_command_blocks_catalog_mutations_and_scans() {
+        let (_directory, paths, database, mut app) = empty_runtime();
+        let (_sender, receiver) = unbounded();
+        app.command_receiver = Some(receiver);
+
+        assert!(
+            format!(
+                "{:#}",
+                app.ensure_catalog_mutation_idle().expect_err("busy")
+            )
+            .contains("background command")
+        );
+        app.start_scan(&database, &paths, &Config::default());
+        assert!(app.scan_receiver.is_none());
+        assert_eq!(
+            app.status,
+            "Wait for the background command before scanning"
+        );
+    }
+
+    #[test]
+    fn background_move_blocks_mutations_scans_and_early_exit() {
+        let (_directory, paths, database, mut app) = empty_runtime();
+        let (_sender, receiver) = unbounded();
+        app.move_receiver = Some(receiver);
+        app.move_started = Some(Instant::now());
+
+        assert!(
+            format!(
+                "{:#}",
+                app.ensure_catalog_mutation_idle().expect_err("busy")
+            )
+            .contains("background move")
+        );
+        app.start_scan(&database, &paths, &Config::default());
+        assert!(app.scan_receiver.is_none());
+        assert_eq!(app.status, "Wait for the background move before scanning");
+
+        handle_browse_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            &database,
+            &paths,
+            &Config::default(),
+        )
+        .expect("quit key");
+        assert!(!app.should_quit);
+        assert_eq!(
+            app.status,
+            "Wait for the background move to finish before quitting"
+        );
     }
 
     fn press(editor: &mut FilterEditor, code: KeyCode) {

@@ -1,4 +1,4 @@
-use std::{io::Write as _, path::PathBuf};
+use std::{collections::HashSet, io::Write as _, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
@@ -27,7 +27,7 @@ use crate::{
         search_resolved, set_favorite,
     },
     config::Config,
-    db::{Database, ImageRecord},
+    db::{Database, ImageRecord, load_images_by_id},
     doctor,
     filter::{AiLabelFilter, ColourFilter, FilterSpecV1},
     model,
@@ -101,6 +101,7 @@ enum Command {
     },
     /// Incrementally catalog all registered sources.
     Scan {
+        /// Rehash and reanalyse images even when filesystem metadata is unchanged.
         #[arg(long)]
         full: bool,
         #[arg(long)]
@@ -754,12 +755,7 @@ struct AppContext {
 
 impl AppContext {
     fn load() -> Result<Self> {
-        let paths = AppPaths::discover()?;
-        paths.ensure_owned_dirs()?;
-        let config = Config::load(&paths.config_file)?;
-        if !paths.config_file.exists() {
-            config.save(&paths.config_file)?;
-        }
+        let (paths, config) = load_paths_and_config()?;
         let database = Database::open(&paths.database)?;
         Ok(Self {
             paths,
@@ -769,23 +765,58 @@ impl AppContext {
     }
 }
 
+fn load_paths_and_config() -> Result<(AppPaths, Config)> {
+    let paths = AppPaths::discover()?;
+    paths.ensure_owned_dirs()?;
+    let config = Config::load(&paths.config_file)?;
+    match std::fs::symlink_metadata(&paths.config_file) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            config.save(&paths.config_file)?;
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect {}", paths.config_file.display()));
+        }
+    }
+    Ok((paths, config))
+}
+
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
-    let mut context = AppContext::load()?;
-    match cli.command.unwrap_or(Command::Tui) {
+    let command = cli.command.unwrap_or(Command::Tui);
+    match command {
+        Command::Doctor { json } => {
+            let (paths, _) = load_paths_and_config()?;
+            command_doctor(&paths, json)
+        }
+        Command::Config { command } => {
+            let (paths, mut config) = load_paths_and_config()?;
+            command_config(&paths, &mut config, command)
+        }
+        Command::Model { command } => {
+            let (paths, _) = load_paths_and_config()?;
+            command_model(&paths, command)
+        }
+        command => run_catalog_command(&AppContext::load()?, command),
+    }
+}
+
+fn run_catalog_command(context: &AppContext, command: Command) -> Result<()> {
+    match command {
         Command::Tui => tui::run(&context.database, &context.paths, &context.config),
-        Command::Doctor { json } => command_doctor(&context.paths, json),
-        Command::Config { command } => command_config(&mut context, command),
-        Command::Source { command } => command_source(&context, command),
-        Command::Scan { full, no_ai, json } => command_scan(&context, full, no_ai, json),
-        Command::Model { command } => command_model(&context, command),
-        Command::Label { command } => command_label(&context, command),
-        Command::Search(arguments) => command_search(&context, arguments),
-        Command::Collection { command } => command_collection(&context, command),
-        Command::Tag { command } => command_tag(&context, command),
-        Command::Favorite { command } => command_favorite(&context, command),
-        Command::Move(arguments) => command_move(&context, arguments),
-        Command::Wpaperd { command } => command_wpaperd(&context, command),
+        Command::Source { command } => command_source(context, command),
+        Command::Scan { full, no_ai, json } => command_scan(context, full, no_ai, json),
+        Command::Label { command } => command_label(context, command),
+        Command::Search(arguments) => command_search(context, arguments),
+        Command::Collection { command } => command_collection(context, command),
+        Command::Tag { command } => command_tag(context, command),
+        Command::Favorite { command } => command_favorite(context, command),
+        Command::Move(arguments) => command_move(context, arguments),
+        Command::Wpaperd { command } => command_wpaperd(context, command),
+        Command::Doctor { .. } | Command::Config { .. } | Command::Model { .. } => {
+            unreachable!("lightweight commands are dispatched before opening the catalog")
+        }
     }
 }
 
@@ -809,19 +840,19 @@ fn command_doctor(paths: &AppPaths, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn command_config(context: &mut AppContext, command: ConfigCommand) -> Result<()> {
+fn command_config(paths: &AppPaths, config: &mut Config, command: ConfigCommand) -> Result<()> {
     match command {
         ConfigCommand::Show { json } => {
             if json {
-                print_json(&context.config)
+                print_json(config)
             } else {
-                print!("{}", toml::to_string_pretty(&context.config)?);
+                print!("{}", toml::to_string_pretty(config)?);
                 Ok(())
             }
         }
         ConfigCommand::Set { key, value } => {
-            context.config.set(&key, &value)?;
-            context.config.save(&context.paths.config_file)?;
+            config.set(&key, &value)?;
+            config.save(&paths.config_file)?;
             println!("set {key}");
             Ok(())
         }
@@ -903,10 +934,10 @@ fn command_scan(context: &AppContext, full: bool, no_ai: bool, json: bool) -> Re
     }
 }
 
-fn command_model(context: &AppContext, command: ModelCommand) -> Result<()> {
+fn command_model(paths: &AppPaths, command: ModelCommand) -> Result<()> {
     match command {
         ModelCommand::Install { yes } => {
-            let status = model::install(&context.paths, yes)?;
+            let status = model::install(paths, yes)?;
             println!(
                 "verified {} at {}",
                 status.model,
@@ -915,7 +946,7 @@ fn command_model(context: &AppContext, command: ModelCommand) -> Result<()> {
             Ok(())
         }
         ModelCommand::Status { verify, json } => {
-            let status = model::status(&context.paths, verify);
+            let status = model::status(paths, verify);
             if json {
                 print_json(&status)
             } else {
@@ -932,7 +963,7 @@ fn command_model(context: &AppContext, command: ModelCommand) -> Result<()> {
             }
         }
         ModelCommand::Remove => {
-            if model::remove(&context.paths)? {
+            if model::remove(paths)? {
                 println!("removed pinned CLIP model");
             } else {
                 println!("pinned CLIP model was not installed");
@@ -1157,8 +1188,15 @@ fn command_wpaperd(context: &AppContext, command: WpaperdCommand) -> Result<()> 
             Ok(())
         }
         WpaperdCommand::Refresh { display } => {
-            let bindings = wpaperd::refresh(&context.database, &context.paths, display.as_deref())?;
-            println!("refreshed {} binding(s)", bindings.len());
+            let report = wpaperd::refresh(&context.database, &context.paths, display.as_deref())?;
+            if let Some(failures) = report.failure_summary() {
+                bail!(
+                    "refreshed {} binding(s); {} failed: {failures}",
+                    report.refreshed.len(),
+                    report.failures.len()
+                );
+            }
+            println!("refreshed {} binding(s)", report.refreshed.len());
             Ok(())
         }
         WpaperdCommand::Status { json } => {
@@ -1362,18 +1400,34 @@ fn parse_label_definitions(values: &[String]) -> Result<Vec<model::LabelDefiniti
 }
 
 fn load_images(database: &Database, ids: &[i64]) -> Result<Vec<ImageRecord>> {
-    ids.iter()
-        .map(|id| {
-            database
-                .get_image(*id)?
-                .with_context(|| format!("image not found: {id}"))
-        })
-        .collect()
+    let mut unique = HashSet::with_capacity(ids.len());
+    for id in ids {
+        if !unique.insert(*id) {
+            bail!("duplicate image id: {id}");
+        }
+    }
+    database.with_connection(|connection| {
+        let images = load_images_by_id(connection, ids)?;
+        if images.len() != ids.len() {
+            let loaded = images.iter().map(|image| image.id).collect::<HashSet<_>>();
+            let missing = ids
+                .iter()
+                .find(|id| !loaded.contains(*id))
+                .context("an image disappeared while loading the move selection")?;
+            bail!("image not found: {missing}");
+        }
+        Ok(images)
+    })
 }
 
 fn refresh_after_change(context: &AppContext) {
-    if let Err(error) = wpaperd::refresh(&context.database, &context.paths, None) {
-        eprintln!("warning: wpaperd bindings were not refreshed: {error:#}");
+    match wpaperd::refresh(&context.database, &context.paths, None) {
+        Ok(report) => {
+            if let Some(failures) = report.failure_summary() {
+                eprintln!("warning: some wpaperd bindings were not refreshed: {failures}");
+            }
+        }
+        Err(error) => eprintln!("warning: wpaperd bindings were not refreshed: {error:#}"),
     }
 }
 

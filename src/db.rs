@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     ffi::OsString,
     path::{Path, PathBuf},
     sync::Mutex,
@@ -6,12 +7,19 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 
-use crate::analysis::{Oklab, PaletteColor};
+use crate::{
+    analysis::{Oklab, PaletteColor},
+    filesystem::absolute_lexical,
+};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
+
+// Stay below SQLite's legacy 999-variable limit while reducing catalog reads to
+// a small, fixed number of statements per batch.
+const IMAGE_LOAD_BATCH_SIZE: usize = 500;
 
 #[derive(Debug)]
 pub struct Database {
@@ -108,7 +116,7 @@ impl Database {
             .with_context(|| format!("failed to open catalog at {}", path.display()))?;
         configure(&connection)?;
         migrate(&mut connection)?;
-        seed_label_packs(&connection)?;
+        seed_label_packs(&mut connection)?;
         Ok(Self {
             path: path.to_owned(),
             connection: Mutex::new(connection),
@@ -178,7 +186,10 @@ impl Database {
     }
 
     pub fn remove_source(&self, path: &Path) -> Result<bool> {
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_owned());
+        let canonical = match path.canonicalize() {
+            Ok(path) => path,
+            Err(_) => absolute_lexical(path)?,
+        };
         self.with_connection(|connection| {
             let changed = connection.execute(
                 "DELETE FROM source_roots WHERE path = ?1",
@@ -221,9 +232,14 @@ fn migrate(connection: &mut Connection) -> Result<()> {
     if version > SCHEMA_VERSION {
         bail!("catalog schema {version} is newer than this bgm supports ({SCHEMA_VERSION})");
     }
-    if version == 0 {
+    if version < SCHEMA_VERSION {
         let transaction = connection.transaction()?;
-        migration_v1(&transaction)?;
+        if version < 1 {
+            migration_v1(&transaction)?;
+        }
+        if version < 2 {
+            migration_v2(&transaction)?;
+        }
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
     }
@@ -362,7 +378,27 @@ fn migration_v1(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
-fn seed_label_packs(connection: &Connection) -> Result<()> {
+fn migration_v2(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        "CREATE INDEX images_status_path_idx ON images(status, path);
+         CREATE INDEX embeddings_model_idx ON embeddings(model_id, normalized, image_id);
+         CREATE INDEX image_tags_tag_idx ON image_tags(tag_id, image_id);
+         CREATE INDEX label_scores_pack_idx ON label_scores(pack_id, image_id);
+         CREATE INDEX wpaperd_bindings_collection_idx ON wpaperd_bindings(collection_id);
+         CREATE INDEX move_items_image_idx ON move_items(image_id);",
+    )?;
+    Ok(())
+}
+
+fn seed_label_packs(connection: &mut Connection) -> Result<usize> {
+    let present = connection.query_row(
+        "SELECT COUNT(*) FROM label_packs WHERE name IN ('mood', 'subject', 'style')",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if present == 3 {
+        return Ok(0);
+    }
     let now = Utc::now().timestamp_millis();
     let packs = [
         (
@@ -381,14 +417,18 @@ fn seed_label_packs(connection: &Connection) -> Result<()> {
             r#"["3d render","anime","digital art","illustration","minimalist","painting","photograph","pixel art"]"#,
         ),
     ];
+    let transaction = connection.transaction()?;
+    let mut insert = transaction.prepare(
+        "INSERT OR IGNORE INTO label_packs(name, kind, labels_json, updated_at)
+         VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    let mut changed = 0;
     for (name, kind, labels) in packs {
-        connection.execute(
-            "INSERT OR IGNORE INTO label_packs(name, kind, labels_json, updated_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![name, kind, labels, now],
-        )?;
+        changed += insert.execute(params![name, kind, labels, now])?;
     }
-    Ok(())
+    drop(insert);
+    transaction.commit()?;
+    Ok(changed)
 }
 
 fn source_by_path(connection: &Connection, path: &Path) -> Result<Option<SourceRoot>> {
@@ -409,72 +449,67 @@ fn source_by_path(connection: &Connection, path: &Path) -> Result<Option<SourceR
 }
 
 fn load_image(connection: &Connection, id: i64) -> Result<Option<ImageRecord>> {
-    let mut record = connection
-        .query_row(
+    Ok(load_images_by_id(connection, &[id])?.pop())
+}
+
+pub(crate) fn load_images_by_id(connection: &Connection, ids: &[i64]) -> Result<Vec<ImageRecord>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut images = HashMap::with_capacity(ids.len());
+    for batch in ids.chunks(IMAGE_LOAD_BATCH_SIZE) {
+        let placeholders = vec!["?"; batch.len()].join(", ");
+        let sql = format!(
             "SELECT i.id, i.source_id, i.path, i.size, i.modified_ns, i.blake3,
                     i.status, i.error, i.width, i.height, i.ratio, i.orientation,
                     i.common_ratio, i.dominant_hex, i.dominant_name, i.luminance,
                     i.saturation, i.contrast, i.light_dark, i.thumbnail_path,
                     EXISTS(SELECT 1 FROM favorites f WHERE f.image_id = i.id)
-             FROM images i WHERE i.id = ?1",
-            [id],
-            |row| {
-                let status: String = row.get(6)?;
-                Ok((
-                    ImageRecord {
-                        id: row.get(0)?,
-                        source_id: row.get(1)?,
-                        path: path_from_bytes(row.get_ref(2)?.as_blob()?),
-                        size: row.get::<_, i64>(3)? as u64,
-                        modified_ns: row.get(4)?,
-                        hash: row.get(5)?,
-                        status: ImageStatus::parse(&status).map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                6,
-                                rusqlite::types::Type::Text,
-                                error.into(),
-                            )
-                        })?,
-                        error: row.get(7)?,
-                        width: row.get(8)?,
-                        height: row.get(9)?,
-                        ratio: row.get(10)?,
-                        orientation: row.get(11)?,
-                        common_ratio: row.get(12)?,
-                        dominant_hex: row.get(13)?,
-                        dominant_name: row.get(14)?,
-                        luminance: row.get(15)?,
-                        saturation: row.get(16)?,
-                        contrast: row.get(17)?,
-                        light_dark: row.get(18)?,
-                        thumbnail_path: row.get_ref(19)?.as_blob_or_null()?.map(path_from_bytes),
-                        palette: Vec::new(),
-                        ai_estimates: Vec::new(),
-                        favorite: row.get(20)?,
-                        tags: Vec::new(),
-                    },
-                    id,
-                ))
-            },
-        )
-        .optional()?;
-    if let Some((image, image_id)) = record.as_mut() {
-        let mut statement = connection.prepare(
-            "SELECT t.name FROM tags t
-             JOIN image_tags it ON it.tag_id = t.id
-             WHERE it.image_id = ?1 ORDER BY t.name COLLATE NOCASE",
-        )?;
-        image.tags = statement
-            .query_map([*image_id], |row| row.get(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+             FROM images i WHERE i.id IN ({placeholders})"
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement.query_map(params_from_iter(batch), image_from_row)?;
+        for image in rows {
+            let image = image?;
+            images.insert(image.id, image);
+        }
+    }
 
-        let mut statement = connection.prepare(
-            "SELECT rank, oklab_l, oklab_a, oklab_b, proportion, hex, name
-             FROM image_palette WHERE image_id=?1 ORDER BY rank",
-        )?;
-        image.palette = statement
-            .query_map([*image_id], |row| {
-                Ok(PaletteColor {
+    if images.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    for batch in ids.chunks(IMAGE_LOAD_BATCH_SIZE) {
+        let placeholders = vec!["?"; batch.len()].join(", ");
+
+        let sql = format!(
+            "SELECT it.image_id, t.name FROM image_tags it
+             JOIN tags t ON t.id = it.tag_id
+             WHERE it.image_id IN ({placeholders})
+             ORDER BY it.image_id, t.name COLLATE NOCASE"
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement.query_map(params_from_iter(batch), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (image_id, tag) = row?;
+            if let Some(image) = images.get_mut(&image_id) {
+                image.tags.push(tag);
+            }
+        }
+
+        let sql = format!(
+            "SELECT image_id, oklab_l, oklab_a, oklab_b, proportion, hex, name
+             FROM image_palette WHERE image_id IN ({placeholders})
+             ORDER BY image_id, rank"
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement.query_map(params_from_iter(batch), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                PaletteColor {
                     oklab: Oklab {
                         l: row.get(1)?,
                         a: row.get(2)?,
@@ -483,26 +518,77 @@ fn load_image(connection: &Connection, id: i64) -> Result<Option<ImageRecord>> {
                     proportion: row.get(4)?,
                     hex: row.get(5)?,
                     name: row.get(6)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+                },
+            ))
+        })?;
+        for row in rows {
+            let (image_id, colour) = row?;
+            if let Some(image) = images.get_mut(&image_id) {
+                image.palette.push(colour);
+            }
+        }
 
-        let mut statement = connection.prepare(
-            "SELECT lp.name, ls.label, ls.score FROM label_scores ls
-             JOIN label_packs lp ON lp.id=ls.pack_id WHERE ls.image_id=?1
-             ORDER BY lp.name, ls.score DESC",
-        )?;
-        image.ai_estimates = statement
-            .query_map([*image_id], |row| {
-                Ok(AiEstimate {
-                    pack: row.get(0)?,
-                    label: row.get(1)?,
-                    score: row.get(2)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let sql = format!(
+            "SELECT ls.image_id, lp.name, ls.label, ls.score FROM label_scores ls
+             JOIN label_packs lp ON lp.id = ls.pack_id
+             WHERE ls.image_id IN ({placeholders})
+             ORDER BY ls.image_id, lp.name, ls.score DESC"
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement.query_map(params_from_iter(batch), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                AiEstimate {
+                    pack: row.get(1)?,
+                    label: row.get(2)?,
+                    score: row.get(3)?,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (image_id, estimate) = row?;
+            if let Some(image) = images.get_mut(&image_id) {
+                image.ai_estimates.push(estimate);
+            }
+        }
     }
-    Ok(record.map(|(image, _)| image))
+
+    Ok(ids
+        .iter()
+        .filter_map(|id| images.get(id).cloned())
+        .collect::<Vec<_>>())
+}
+
+fn image_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImageRecord> {
+    let status: String = row.get(6)?;
+    Ok(ImageRecord {
+        id: row.get(0)?,
+        source_id: row.get(1)?,
+        path: path_from_bytes(row.get_ref(2)?.as_blob()?),
+        size: row.get::<_, i64>(3)? as u64,
+        modified_ns: row.get(4)?,
+        hash: row.get(5)?,
+        status: ImageStatus::parse(&status).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, error.into())
+        })?,
+        error: row.get(7)?,
+        width: row.get(8)?,
+        height: row.get(9)?,
+        ratio: row.get(10)?,
+        orientation: row.get(11)?,
+        common_ratio: row.get(12)?,
+        dominant_hex: row.get(13)?,
+        dominant_name: row.get(14)?,
+        luminance: row.get(15)?,
+        saturation: row.get(16)?,
+        contrast: row.get(17)?,
+        light_dark: row.get(18)?,
+        thumbnail_path: row.get_ref(19)?.as_blob_or_null()?.map(path_from_bytes),
+        palette: Vec::new(),
+        ai_estimates: Vec::new(),
+        favorite: row.get(20)?,
+        tags: Vec::new(),
+    })
 }
 
 pub(crate) fn path_bytes(path: &Path) -> Vec<u8> {
@@ -551,6 +637,136 @@ mod tests {
     }
 
     #[test]
+    fn migrates_v1_catalog_without_losing_images() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("catalog.sqlite3");
+        let mut connection = Connection::open(&path).expect("connection");
+        configure(&connection).expect("configure");
+        let transaction = connection.transaction().expect("transaction");
+        migration_v1(&transaction).expect("v1 schema");
+        transaction
+            .execute(
+                "INSERT INTO source_roots(id, path, added_at) VALUES (1, ?1, 0)",
+                [path_bytes(directory.path())],
+            )
+            .expect("source");
+        transaction
+            .execute(
+                "INSERT INTO images(
+                    source_id, path, size, modified_ns, status, discovered_at, updated_at
+                 ) VALUES (1, ?1, 0, 0, 'ready', 0, 0)",
+                [path_bytes(&directory.path().join("wallpaper.png"))],
+            )
+            .expect("image");
+        transaction
+            .pragma_update(None, "user_version", 1)
+            .expect("version");
+        transaction.commit().expect("commit v1");
+        drop(connection);
+
+        let database = Database::open(&path).expect("upgrade database");
+        let (version, images, indexes) = database
+            .with_connection(|connection| {
+                let version =
+                    connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?;
+                let images = connection.query_row("SELECT COUNT(*) FROM images", [], |row| {
+                    row.get::<_, i64>(0)
+                })?;
+                let mut statement = connection.prepare(
+                    "SELECT name FROM sqlite_schema
+                     WHERE type='index' AND name IN (
+                        'images_status_path_idx', 'embeddings_model_idx',
+                        'image_tags_tag_idx', 'label_scores_pack_idx',
+                        'wpaperd_bindings_collection_idx', 'move_items_image_idx'
+                     ) ORDER BY name",
+                )?;
+                let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+                Ok((version, images, rows.collect::<rusqlite::Result<Vec<_>>>()?))
+            })
+            .expect("upgraded state");
+
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(images, 1_i64);
+        assert_eq!(indexes.len(), 6);
+    }
+
+    #[test]
+    fn schema_indexes_support_default_searches_and_model_reads() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = Database::open(directory.path().join("catalog.sqlite3")).expect("database");
+        database
+            .with_connection(|connection| {
+                let default_search = query_plan(
+                    connection,
+                    "SELECT i.id FROM images i WHERE i.status='ready' ORDER BY i.path",
+                )?;
+                assert!(
+                    default_search
+                        .iter()
+                        .any(|detail| detail.contains("images_status_path_idx"))
+                );
+                assert!(
+                    default_search
+                        .iter()
+                        .all(|detail| !detail.contains("USE TEMP B-TREE"))
+                );
+
+                let embeddings = query_plan(
+                    connection,
+                    "SELECT image_id, vector, dimension FROM embeddings
+                     WHERE model_id='model' AND normalized=1 ORDER BY image_id",
+                )?;
+                assert!(
+                    embeddings
+                        .iter()
+                        .any(|detail| detail.contains("embeddings_model_idx"))
+                );
+
+                let tag_cleanup = query_plan(
+                    connection,
+                    "DELETE FROM tags WHERE NOT EXISTS
+                     (SELECT 1 FROM image_tags it WHERE it.tag_id=tags.id)",
+                )?;
+                assert!(
+                    tag_cleanup
+                        .iter()
+                        .any(|detail| detail.contains("image_tags_tag_idx"))
+                );
+                Ok(())
+            })
+            .expect("query plans");
+    }
+
+    #[test]
+    fn label_pack_seeding_has_a_read_only_fast_path_and_batches_repairs() {
+        let mut connection = Connection::open_in_memory().expect("connection");
+        configure(&connection).expect("configure");
+        migrate(&mut connection).expect("schema");
+
+        assert_eq!(seed_label_packs(&mut connection).expect("initial seed"), 3);
+        assert_eq!(seed_label_packs(&mut connection).expect("fast path"), 0);
+        connection
+            .execute("DELETE FROM label_packs WHERE name='mood'", [])
+            .expect("remove seed");
+        assert_eq!(seed_label_packs(&mut connection).expect("repair seed"), 1);
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM label_packs", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("pack count"),
+            3
+        );
+    }
+
+    fn query_plan(connection: &Connection, sql: &str) -> Result<Vec<String>> {
+        let mut statement = connection.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(3))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    #[test]
     fn source_paths_round_trip() {
         let directory = tempfile::tempdir().expect("tempdir");
         let database = Database::open(directory.path().join("db")).expect("database");
@@ -559,5 +775,113 @@ mod tests {
         let inserted = database.add_source(&images).expect("add source");
         assert_eq!(inserted.path, images.canonicalize().expect("canonical"));
         assert_eq!(database.list_sources().expect("sources"), vec![inserted]);
+    }
+
+    #[test]
+    fn missing_source_can_be_removed_through_a_lexically_equivalent_path() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = Database::open(directory.path().join("db")).expect("database");
+        let images = directory.path().join("images");
+        std::fs::create_dir(&images).expect("images directory");
+        database.add_source(&images).expect("add source");
+        std::fs::remove_dir(&images).expect("remove source directory");
+
+        assert!(
+            database
+                .remove_source(&images.join("missing-child").join(".."))
+                .expect("remove missing source")
+        );
+        assert!(database.list_sources().expect("sources").is_empty());
+    }
+
+    #[test]
+    fn bulk_image_loading_preserves_order_and_related_data_across_batches() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = Database::open(directory.path().join("db")).expect("database");
+        let image_directory = directory.path().join("wallpapers");
+        std::fs::create_dir(&image_directory).expect("images directory");
+        let source = database.add_source(&image_directory).expect("source");
+        let mut ids = Vec::new();
+
+        database
+            .with_transaction(|transaction| {
+                let mut insert = transaction.prepare(
+                    "INSERT INTO images(
+                        source_id, path, size, modified_ns, status, discovered_at, updated_at
+                     ) VALUES (?1, ?2, ?3, ?3, 'ready', 0, 0)",
+                )?;
+                for ordinal in 0..=IMAGE_LOAD_BATCH_SIZE {
+                    let path = image_directory.join(format!("image-{ordinal:04}.jpg"));
+                    insert.execute(params![source.id, path_bytes(&path), ordinal as i64])?;
+                    ids.push(transaction.last_insert_rowid());
+                }
+                drop(insert);
+
+                let enriched_id = ids[0];
+                transaction.execute(
+                    "INSERT INTO favorites(image_id, set_at) VALUES (?1, 0)",
+                    [enriched_id],
+                )?;
+                transaction.execute("INSERT INTO tags(name) VALUES ('zeta'), ('Alpha')", [])?;
+                transaction.execute(
+                    "INSERT INTO image_tags(image_id, tag_id)
+                     SELECT ?1, id FROM tags",
+                    [enriched_id],
+                )?;
+                transaction.execute(
+                    "INSERT INTO image_palette(
+                        image_id, rank, oklab_l, oklab_a, oklab_b, proportion, hex, name
+                     ) VALUES
+                        (?1, 1, 0.2, 0.3, 0.4, 0.25, '#222222', 'black'),
+                        (?1, 0, 0.5, 0.6, 0.7, 0.75, '#111111', 'black')",
+                    [enriched_id],
+                )?;
+                transaction.execute(
+                    "INSERT INTO label_scores(image_id, pack_id, label, score)
+                     SELECT ?1, id, 'calm', 0.4 FROM label_packs WHERE name = 'mood'",
+                    [enriched_id],
+                )?;
+                transaction.execute(
+                    "INSERT INTO label_scores(image_id, pack_id, label, score)
+                     SELECT ?1, id, 'dreamy', 0.8 FROM label_packs WHERE name = 'mood'",
+                    [enriched_id],
+                )?;
+                Ok(())
+            })
+            .expect("fixture data");
+
+        let mut requested = ids.clone();
+        requested.reverse();
+        requested.push(ids[0]);
+        let loaded = database
+            .with_connection(|connection| load_images_by_id(connection, &requested))
+            .expect("bulk load");
+
+        assert_eq!(
+            loaded.iter().map(|image| image.id).collect::<Vec<_>>(),
+            requested
+        );
+        let enriched = loaded
+            .iter()
+            .find(|image| image.id == ids[0])
+            .expect("enriched image");
+        assert!(enriched.favorite);
+        assert_eq!(enriched.tags, ["Alpha", "zeta"]);
+        assert_eq!(
+            enriched
+                .palette
+                .iter()
+                .map(|colour| colour.hex.as_str())
+                .collect::<Vec<_>>(),
+            ["#111111", "#222222"]
+        );
+        assert_eq!(
+            enriched
+                .ai_estimates
+                .iter()
+                .map(|estimate| estimate.label.as_str())
+                .collect::<Vec<_>>(),
+            ["dreamy", "calm"]
+        );
     }
 }

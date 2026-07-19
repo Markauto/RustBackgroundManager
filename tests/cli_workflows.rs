@@ -68,6 +68,31 @@ impl Fixture {
 }
 
 #[test]
+fn lightweight_commands_do_not_create_or_open_the_catalog() {
+    let fixture = Fixture::new();
+    let database = fixture.root.join("data/bgm/catalog.sqlite3");
+
+    fixture
+        .command()
+        .args(["config", "show", "--json"])
+        .assert()
+        .success();
+    assert!(!database.exists());
+    fixture
+        .command()
+        .args(["config", "set", "ai.enabled", "false"])
+        .assert()
+        .success();
+    assert!(!database.exists());
+    fixture
+        .command()
+        .args(["model", "status", "--json"])
+        .assert()
+        .success();
+    assert!(!database.exists());
+}
+
+#[test]
 fn catalog_tags_favorites_and_collections_emit_valid_json() {
     let fixture = Fixture::new();
     let image = fixture.source.join("blue.png");
@@ -160,4 +185,60 @@ fn cli_move_is_dry_run_then_apply_and_byte_identical_undo() {
     let undo: Value = serde_json::from_slice(&output.stdout).expect("undo result");
     assert_eq!(undo["status"], "undone");
     assert_eq!(fs::read(&image).expect("restored"), original);
+}
+
+#[test]
+fn wpaperd_refresh_reports_partial_failure_after_refreshing_healthy_bindings() {
+    let fixture = Fixture::new();
+    let image = fixture.source.join("wall.png");
+    let id = fixture.add_and_scan(&image);
+    fixture
+        .command()
+        .args(["tag", "add", "temporary", &id.to_string()])
+        .assert()
+        .success();
+    fixture
+        .command()
+        .args(["collection", "save", "temporary", "--tag", "temporary"])
+        .assert()
+        .success();
+    fixture
+        .command()
+        .args(["collection", "save", "all"])
+        .assert()
+        .success();
+    fixture
+        .command()
+        .args(["wpaperd", "bind", "any", "temporary"])
+        .assert()
+        .success();
+    fixture
+        .command()
+        .args(["wpaperd", "bind", "DP-1", "all"])
+        .assert()
+        .success();
+    fixture
+        .command()
+        .args(["tag", "remove", "temporary", &id.to_string()])
+        .assert()
+        .success();
+
+    let output = fixture
+        .command()
+        .args(["wpaperd", "refresh"])
+        .output()
+        .expect("refresh");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("refreshed 1 binding(s); 1 failed"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("any (temporary)"), "{stderr}");
+    assert_eq!(
+        fs::read_dir(fixture.root.join("state/bgm/wpaperd/any"))
+            .expect("preserved pool")
+            .count(),
+        1
+    );
 }

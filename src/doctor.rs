@@ -156,8 +156,26 @@ fn find_command(command: &str) -> Option<PathBuf> {
     env::var_os("PATH").and_then(|path| {
         env::split_paths(&path)
             .map(|directory| directory.join(command))
-            .find(|candidate| candidate.is_file())
+            .find(|candidate| is_executable_file(candidate))
     })
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 fn pass(checks: &mut Vec<DoctorCheck>, name: impl Into<String>, message: impl Into<String>) {
@@ -182,4 +200,27 @@ fn fail(checks: &mut Vec<DoctorCheck>, name: impl Into<String>, message: impl In
         level: CheckLevel::Fail,
         message: message.into(),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn command_checks_require_an_executable_regular_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let candidate = directory.path().join("tool");
+        std::fs::write(&candidate, b"#!/bin/sh\n").expect("candidate");
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o644))
+            .expect("non-executable mode");
+        assert!(!is_executable_file(&candidate));
+
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o755))
+            .expect("executable mode");
+        assert!(is_executable_file(&candidate));
+        assert!(!is_executable_file(directory.path()));
+    }
 }

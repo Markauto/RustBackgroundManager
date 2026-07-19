@@ -21,6 +21,12 @@ bgm scan --no-ai
 
 AI and semantic commands return an explicit error in that build.
 
+Normal scans use path, size, and modification time to avoid reopening unchanged
+images. When filesystem metadata changes, bgm recalculates BLAKE3 and reuses the
+existing analysis if the content is identical. `bgm scan --full` forces every
+in-bounds image to be rehashed and reanalysed. Safe moves independently hash the
+current bytes before applying or undoing an operation.
+
 ## First run
 
 ```sh
@@ -57,6 +63,8 @@ bgm collection show night --json
 ```
 
 Filters cover source IDs, path fragments, dimensions, orientation, aspect ratios, luminance/light-dark class, dominant and palette Oklab distance, AI label estimates, arbitrary semantic text, tags, and favorites. The TUI’s `/` editor exposes the complete filter as editable `FilterSpecV1` JSON alongside built-in examples and saved presets. TUI presets use the existing saved-collection store, so presets created there are also available to `bgm collection`, wpaperd bindings, and later TUI sessions.
+
+The TUI resolves semantic filters and semantic wpaperd collections on serialized background workers. Those workers never open an interactive download prompt; run `bgm model install` before using semantic TUI workflows.
 
 CLIP outputs are displayed as ranked estimates rather than authoritative tags. Seeded `mood`, `subject`, and `style` label packs can be edited, and custom packs can supply multiple prompts per label:
 
@@ -103,7 +111,7 @@ bgm wpaperd unbind DP-1
 
 Empty collections are refused. Each pool is built as collision-safe symlinks in a temporary sibling directory and atomically exchanged into place. Only the selected section’s `path` is edited with `toml_edit`; comments, formatting, and unrelated keys are retained. The original config is backed up once, and unbind restores the displaced path only if the live value still points at bgm’s managed pool.
 
-Scans, moves, label/tag/favorite changes, and collection updates refresh active bindings. If a collection becomes empty, its existing pool remains in place and refresh reports an error rather than replacing it with an empty directory.
+Scans, moves, label/tag/favorite changes, and collection updates refresh active bindings. If a collection becomes empty, its existing pool remains in place rather than being replaced with an empty directory. Other healthy bindings are still refreshed, and bgm reports each failed display.
 
 ## TUI keys
 

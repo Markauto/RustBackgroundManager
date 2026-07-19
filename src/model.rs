@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     fs,
     io::{IsTerminal as _, Read as _, Write as _},
     path::{Path, PathBuf},
@@ -42,6 +43,10 @@ const ARTIFACTS: [Artifact; 4] = [
         sha256: "910e70b3956ac9879ebc90b22fb3bc8a75b6a0677814500101a4c072bd7857bd",
     },
 ];
+
+thread_local! {
+    static INTERACTIVE_INSTALL_ALLOWED: Cell<bool> = const { Cell::new(true) };
+}
 
 #[derive(Clone, Copy, Debug)]
 struct Artifact {
@@ -189,35 +194,70 @@ pub fn install_with_progress(
     verify_directory(temporary.path())?;
 
     let destination = model_directory(paths);
-    let temporary_path = temporary.keep();
-    if destination.exists() {
-        rustix::fs::renameat_with(
-            rustix::fs::CWD,
-            &temporary_path,
-            rustix::fs::CWD,
-            &destination,
-            rustix::fs::RenameFlags::EXCHANGE,
-        )
-        .map_err(errno_to_io)?;
-        fs::remove_dir_all(&temporary_path)?;
-    } else {
-        rustix::fs::renameat_with(
-            rustix::fs::CWD,
-            &temporary_path,
-            rustix::fs::CWD,
-            &destination,
-            rustix::fs::RenameFlags::NOREPLACE,
-        )
-        .map_err(errno_to_io)?;
-    }
-    fs::File::open(&paths.models_dir)?.sync_all()?;
+    install_model_directory(temporary, &destination)?;
     Ok(status(paths, false))
+}
+
+fn install_model_directory(temporary: tempfile::TempDir, destination: &Path) -> Result<()> {
+    let parent = destination
+        .parent()
+        .context("model destination has no parent")?;
+    fs::File::open(temporary.path())
+        .and_then(|directory| directory.sync_all())
+        .context("failed to sync the downloaded model directory")?;
+    match fs::symlink_metadata(destination) {
+        Ok(metadata) if !metadata.file_type().is_dir() => {
+            bail!(
+                "refusing to replace non-directory model path {}",
+                destination.display()
+            );
+        }
+        Ok(_) => {
+            rustix::fs::renameat_with(
+                rustix::fs::CWD,
+                temporary.path(),
+                rustix::fs::CWD,
+                destination,
+                rustix::fs::RenameFlags::EXCHANGE,
+            )
+            .map_err(errno_to_io)
+            .context("failed to atomically replace the installed model")?;
+            temporary
+                .close()
+                .context("failed to remove the displaced model directory")?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            rustix::fs::renameat_with(
+                rustix::fs::CWD,
+                temporary.path(),
+                rustix::fs::CWD,
+                destination,
+                rustix::fs::RenameFlags::NOREPLACE,
+            )
+            .map_err(errno_to_io)
+            .context("failed to install the downloaded model")?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    fs::File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 pub fn remove(paths: &AppPaths) -> Result<bool> {
     let directory = model_directory(paths);
-    if !directory.exists() {
-        return Ok(false);
+    match fs::symlink_metadata(&directory) {
+        Ok(metadata) if !metadata.file_type().is_dir() => {
+            bail!(
+                "refusing to recursively remove non-directory model path {}",
+                directory.display()
+            );
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect {}", directory.display()));
+        }
     }
     fs::remove_dir_all(&directory)
         .with_context(|| format!("failed to remove {}", directory.display()))?;
@@ -230,7 +270,26 @@ pub fn ensure_installed(paths: &AppPaths) -> Result<PathBuf> {
     if current.verified {
         return Ok(current.directory);
     }
+    if !INTERACTIVE_INSTALL_ALLOWED.get() {
+        bail!(
+            "CLIP is not installed; background work cannot prompt, so run `bgm model install --yes` first"
+        );
+    }
     install(paths, false).map(|installed| installed.directory)
+}
+
+pub(crate) fn without_interactive_install<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    struct RestoreInteractiveInstall(bool);
+
+    impl Drop for RestoreInteractiveInstall {
+        fn drop(&mut self) {
+            INTERACTIVE_INSTALL_ALLOWED.set(self.0);
+        }
+    }
+
+    let previous = INTERACTIVE_INSTALL_ALLOWED.replace(false);
+    let _restore = RestoreInteractiveInstall(previous);
+    operation()
 }
 
 pub fn list_label_packs(database: &Database) -> Result<Vec<LabelPack>> {
@@ -376,6 +435,33 @@ pub fn semantic_scores(
 
 #[cfg(not(feature = "rocm"))]
 pub fn semantic_scores(_: &Database, _: &AppPaths, _: &str) -> Result<Vec<(i64, f32)>> {
+    bail!("semantic search requires ROCm; CPU fallback is intentionally disabled")
+}
+
+#[cfg(feature = "rocm")]
+pub(crate) fn semantic_scores_for_images(
+    database: &Database,
+    paths: &AppPaths,
+    text: &str,
+    image_ids: &[i64],
+) -> Result<Vec<(i64, f32)>> {
+    if image_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let directory = ensure_installed(paths)?;
+    clip::semantic_scores_for_images(database, &directory, text, image_ids)
+}
+
+#[cfg(not(feature = "rocm"))]
+pub(crate) fn semantic_scores_for_images(
+    _: &Database,
+    _: &AppPaths,
+    _: &str,
+    image_ids: &[i64],
+) -> Result<Vec<(i64, f32)>> {
+    if image_ids.is_empty() {
+        return Ok(Vec::new());
+    }
     bail!("semantic search requires ROCm; CPU fallback is intentionally disabled")
 }
 
@@ -599,6 +685,98 @@ mod tests {
         let current = status(&paths, false);
         assert!(!current.installed);
         assert!(current.problem.is_some());
+    }
+
+    #[test]
+    fn background_model_use_never_starts_an_interactive_install() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let paths = AppPaths::from_xdg_roots(
+            directory.path().join("cfg"),
+            directory.path().join("data"),
+            directory.path().join("cache"),
+            directory.path().join("state"),
+        );
+        let error = without_interactive_install(|| ensure_installed(&paths))
+            .expect_err("missing background model");
+        assert!(format!("{error:#}").contains("background work cannot prompt"));
+    }
+
+    #[test]
+    fn model_directory_install_is_atomic_and_cleans_temporary_state() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let destination = directory.path().join("model");
+        fs::create_dir(&destination).expect("old model");
+        fs::write(destination.join("old"), b"old").expect("old artifact");
+        let replacement = Builder::new()
+            .prefix(".clip-download-")
+            .tempdir_in(directory.path())
+            .expect("replacement");
+        fs::write(replacement.path().join("new"), b"new").expect("new artifact");
+
+        install_model_directory(replacement, &destination).expect("install replacement");
+        assert_eq!(
+            fs::read(destination.join("new")).expect("new model"),
+            b"new"
+        );
+        assert!(!destination.join("old").exists());
+        assert!(
+            fs::read_dir(directory.path())
+                .expect("directory")
+                .all(|entry| !entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".clip-download-"))
+        );
+
+        let collision = directory.path().join("collision");
+        fs::write(&collision, b"preserve").expect("collision");
+        let rejected = Builder::new()
+            .prefix(".clip-download-")
+            .tempdir_in(directory.path())
+            .expect("rejected download");
+        let rejected_path = rejected.path().to_owned();
+        let error = install_model_directory(rejected, &collision).expect_err("collision");
+        assert!(format!("{error:#}").contains("refusing to replace non-directory"));
+        assert_eq!(
+            fs::read(collision).expect("preserved collision"),
+            b"preserve"
+        );
+        assert!(!rejected_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_removal_does_not_follow_or_delete_a_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let paths = AppPaths::from_xdg_roots(
+            directory.path().join("cfg"),
+            directory.path().join("data"),
+            directory.path().join("cache"),
+            directory.path().join("state"),
+        );
+        fs::create_dir_all(&paths.models_dir).expect("models directory");
+        let outside = directory.path().join("outside-model");
+        fs::create_dir(&outside).expect("outside model");
+        fs::write(outside.join("sentinel"), b"preserve").expect("sentinel");
+        let link = model_directory(&paths);
+        symlink(&outside, &link).expect("model symlink");
+
+        let error = remove(&paths).expect_err("symlink must be rejected");
+
+        assert!(format!("{error:#}").contains("non-directory model path"));
+        assert!(
+            fs::symlink_metadata(&link)
+                .expect("link preserved")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read(outside.join("sentinel")).expect("target preserved"),
+            b"preserve"
+        );
     }
 
     #[test]

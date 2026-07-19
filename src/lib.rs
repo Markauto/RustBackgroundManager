@@ -6,6 +6,7 @@ pub mod collection;
 pub mod config;
 pub mod db;
 pub mod doctor;
+mod filesystem;
 pub mod filter;
 mod filter_completion;
 pub mod model;

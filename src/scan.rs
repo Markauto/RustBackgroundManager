@@ -1,25 +1,27 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs::File,
-    io::BufReader,
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context as _, Result};
 use chrono::Utc;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Transaction, params};
 use serde::Serialize;
 use walkdir::WalkDir;
 
 use crate::{
     AppPaths,
     analysis::{
-        ImageAnalysis, analyze_image, probe_dimensions, within_import_bounds, write_thumbnail,
+        ImageAnalysis, analyze_image, decode_image, probe_dimensions, within_import_bounds,
+        write_thumbnail,
     },
     config::Config,
     db::{Database, ImageStatus, SourceRoot, path_bytes, path_from_bytes},
+    filesystem::blake3_file,
 };
+
+const SCAN_WRITE_BATCH_SIZE: usize = 32;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ScanOptions {
@@ -64,6 +66,7 @@ struct Discovery {
 #[derive(Clone, Debug)]
 struct Existing {
     id: i64,
+    source_id: i64,
     size: u64,
     modified_ns: i64,
     hash: Option<String>,
@@ -73,8 +76,46 @@ struct Existing {
 
 #[derive(Clone, Debug)]
 enum ProcessOutcome {
-    Complete,
-    RecordedFailure(String),
+    Complete(Option<CatalogMutation>),
+    RecordedFailure {
+        mutation: CatalogMutation,
+        error: String,
+    },
+}
+
+#[derive(Clone, Debug)]
+enum CatalogMutation {
+    Analysis {
+        discovery: Discovery,
+        hash: String,
+        thumbnail: PathBuf,
+        analysis: ImageAnalysis,
+    },
+    OutOfBounds {
+        discovery: Discovery,
+        dimensions: (u32, u32),
+    },
+    Status {
+        discovery: Discovery,
+        status: ImageStatus,
+        error: String,
+        analysis_key: String,
+    },
+    Touch {
+        image_id: i64,
+        discovery: Discovery,
+    },
+    RestoreReady {
+        image_id: i64,
+        discovery: Discovery,
+    },
+}
+
+struct ProcessContext<'a> {
+    paths: &'a AppPaths,
+    config: &'a Config,
+    options: ScanOptions,
+    analysis_key: &'a str,
 }
 
 pub fn scan_catalog(
@@ -95,6 +136,7 @@ pub fn scan_catalog_with_progress(
 ) -> Result<ScanReport> {
     let sources = database.list_sources()?;
     let (discoveries, traversal_failures, unreliable_sources) = discover(&sources);
+    let mut existing = existing_images(database)?;
     progress(ScanEvent::Started {
         files: discoveries.len(),
     });
@@ -103,50 +145,64 @@ pub fn scan_catalog_with_progress(
         discovered: discoveries.len(),
         ..ScanReport::default()
     };
+    let context = ProcessContext {
+        paths,
+        config,
+        options,
+        analysis_key: &analysis_key,
+    };
+    let mut mutations = Vec::with_capacity(SCAN_WRITE_BATCH_SIZE);
     for failure in traversal_failures {
         record_failure(&mut report, &mut progress, failure);
     }
 
-    let mut seen = HashSet::with_capacity(discoveries.len());
     for (index, discovery) in discoveries.into_iter().enumerate() {
-        seen.insert(discovery.path.clone());
+        let previous = existing.remove(&discovery.path);
         progress(ScanEvent::Processing {
             index: index + 1,
             path: discovery.path.clone(),
         });
-        match process_file(
-            database,
-            paths,
-            config,
-            options,
-            &analysis_key,
-            &discovery,
-            &mut report,
-        ) {
-            Ok(ProcessOutcome::Complete) => {}
-            Ok(ProcessOutcome::RecordedFailure(error)) => record_failure(
-                &mut report,
-                &mut progress,
-                FileFailure {
-                    path: discovery.path,
-                    error,
-                },
-            ),
-            Err(error) => {
-                let message = format!("{error:#}");
-                let _ = store_failure(database, &discovery, &message);
+        let mutation = match process_file(&context, &discovery, previous.as_ref(), &mut report) {
+            Ok(ProcessOutcome::Complete(mutation)) => mutation,
+            Ok(ProcessOutcome::RecordedFailure { mutation, error }) => {
                 record_failure(
                     &mut report,
                     &mut progress,
                     FileFailure {
-                        path: discovery.path,
-                        error: message,
+                        path: discovery.path.clone(),
+                        error,
                     },
                 );
+                Some(mutation)
             }
+            Err(error) => {
+                let message = format!("{error:#}");
+                record_failure(
+                    &mut report,
+                    &mut progress,
+                    FileFailure {
+                        path: discovery.path.clone(),
+                        error: message.clone(),
+                    },
+                );
+                Some(CatalogMutation::Status {
+                    discovery: discovery.clone(),
+                    status: ImageStatus::Error,
+                    error: message,
+                    analysis_key: String::new(),
+                })
+            }
+        };
+        if let Some(mutation) = mutation {
+            mutations.push(mutation);
+        }
+        if mutations.len() >= SCAN_WRITE_BATCH_SIZE {
+            persist_mutations(database, &mutations, &analysis_key)?;
+            mutations.clear();
         }
     }
-    report.missing = mark_missing(database, &seen, &sources, &unreliable_sources)?;
+    persist_mutations(database, &mutations, &analysis_key)?;
+    report.missing = mark_missing(database, &sources, &unreliable_sources, &existing)?;
     progress(ScanEvent::Finished(report.clone()));
     Ok(report)
 }
@@ -155,11 +211,18 @@ fn discover(sources: &[SourceRoot]) -> (Vec<Discovery>, Vec<FileFailure>, HashSe
     let mut by_path: HashMap<PathBuf, Discovery> = HashMap::new();
     let mut failures = Vec::new();
     let mut unreliable_sources = HashSet::new();
-    // More specific roots win ownership when roots overlap.
-    let mut roots = sources.to_vec();
-    roots.sort_by_key(|source| source.path.components().count());
-    for source in roots {
-        for entry in WalkDir::new(&source.path).follow_links(false) {
+    let registered_roots = sources
+        .iter()
+        .map(|source| source.path.clone())
+        .collect::<HashSet<_>>();
+    for source in sources {
+        // A registered nested root owns its subtree. Pruning it from the
+        // parent's walk avoids reading the same directory tree twice.
+        let entries = WalkDir::new(&source.path)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| entry.depth() == 0 || !registered_roots.contains(entry.path()));
+        for entry in entries {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
@@ -222,101 +285,257 @@ fn discover(sources: &[SourceRoot]) -> (Vec<Discovery>, Vec<FileFailure>, HashSe
 }
 
 fn process_file(
-    database: &Database,
-    paths: &AppPaths,
-    config: &Config,
-    options: ScanOptions,
-    analysis_key: &str,
+    context: &ProcessContext<'_>,
     discovery: &Discovery,
+    existing: Option<&Existing>,
     report: &mut ScanReport,
 ) -> Result<ProcessOutcome> {
-    let existing = existing(database, &discovery.path)?;
+    if let Some(record) = existing
+        && !context.options.full
+        && record.size == discovery.size
+        && record.modified_ns == discovery.modified_ns
+        && record.analysis_key.as_deref() == Some(context.analysis_key)
+    {
+        match record.status {
+            ImageStatus::Ready if record.hash.is_some() => {
+                return reuse_ready_analysis(context, discovery, record, report);
+            }
+            ImageStatus::OutOfBounds => {
+                report.out_of_bounds += 1;
+                return Ok(ProcessOutcome::Complete(discovery_touch_if_changed(
+                    record, discovery,
+                )));
+            }
+            _ => {}
+        }
+    }
+
     let dimensions = match probe_dimensions(&discovery.path) {
         Ok(dimensions) => dimensions,
         Err(error) => {
             let message = format!("{error:#}");
-            store_corrupt(database, discovery, &message, analysis_key)?;
-            return Ok(ProcessOutcome::RecordedFailure(message));
+            return Ok(ProcessOutcome::RecordedFailure {
+                mutation: CatalogMutation::Status {
+                    discovery: discovery.clone(),
+                    status: ImageStatus::Corrupt,
+                    error: message.clone(),
+                    analysis_key: context.analysis_key.to_owned(),
+                },
+                error: message,
+            });
         }
     };
-    if !within_import_bounds(dimensions.0, dimensions.1, &config.import) {
-        store_out_of_bounds(database, discovery, dimensions, analysis_key)?;
+    if !within_import_bounds(dimensions.0, dimensions.1, &context.config.import) {
+        let mutation = CatalogMutation::OutOfBounds {
+            discovery: discovery.clone(),
+            dimensions,
+        };
         report.out_of_bounds += 1;
-        return Ok(ProcessOutcome::Complete);
+        return Ok(ProcessOutcome::Complete(Some(mutation)));
     }
 
-    let hash = hash_file(&discovery.path)?;
-    if let Some(record) = existing.as_ref()
-        && !options.full
-        && record.size == discovery.size
-        && record.modified_ns == discovery.modified_ns
+    let hash = blake3_file(&discovery.path)?;
+    if let Some(record) = existing
+        && !context.options.full
         && record.hash.as_deref() == Some(&hash)
-        && record.status == ImageStatus::Ready
-        && record.analysis_key.as_deref() == Some(analysis_key)
+        && matches!(record.status, ImageStatus::Ready | ImageStatus::Missing)
+        && record.analysis_key.as_deref() == Some(context.analysis_key)
     {
-        touch_existing(database, record.id, discovery)?;
-        report.unchanged += 1;
-        if options.no_ai {
-            report.ai_deferred += 1;
-        }
-        return Ok(ProcessOutcome::Complete);
+        return reuse_ready_analysis(context, discovery, record, report);
     }
 
-    let (analysis, decoded) = analyze_image(&discovery.path, &config.analysis)?;
-    let thumbnail = paths.thumbnails_dir.join(format!("{hash}.jpg"));
-    if options.full || !thumbnail.exists() {
-        write_thumbnail(&decoded, &thumbnail, config.analysis.thumbnail_long_edge)?;
+    let (analysis, decoded) = analyze_image(&discovery.path, &context.config.analysis)?;
+    let thumbnail = context.paths.thumbnails_dir.join(format!("{hash}.jpg"));
+    if context.options.full || !thumbnail.exists() {
+        write_thumbnail(
+            &decoded,
+            &thumbnail,
+            context.config.analysis.thumbnail_long_edge,
+        )?;
     }
-    store_analysis(
-        database,
-        discovery,
-        &hash,
-        analysis_key,
-        &thumbnail,
-        &analysis,
-    )?;
+    let mutation = CatalogMutation::Analysis {
+        discovery: discovery.clone(),
+        hash,
+        thumbnail,
+        analysis,
+    };
     report.analyzed += 1;
-    if options.no_ai {
+    if context.options.no_ai {
         report.ai_deferred += 1;
     }
-    Ok(ProcessOutcome::Complete)
+    Ok(ProcessOutcome::Complete(Some(mutation)))
 }
 
-fn existing(database: &Database, path: &Path) -> Result<Option<Existing>> {
-    database.with_connection(|connection| {
-        let row = connection
-            .query_row(
-                "SELECT id, size, modified_ns, blake3, status, analysis_key
-                 FROM images WHERE path = ?1",
-                [path_bytes(path)],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get::<_, i64>(1)? as u64,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get(5)?,
-                    ))
-                },
-            )
-            .optional()?;
-        row.map(|(id, size, modified_ns, hash, status, analysis_key)| {
-            Ok(Existing {
-                id,
-                size,
-                modified_ns,
-                hash,
-                status: ImageStatus::parse(&status)?,
-                analysis_key,
-            })
+fn reuse_ready_analysis(
+    context: &ProcessContext<'_>,
+    discovery: &Discovery,
+    existing: &Existing,
+    report: &mut ScanReport,
+) -> Result<ProcessOutcome> {
+    let hash = existing
+        .hash
+        .as_deref()
+        .context("ready image has no retained content hash")?;
+    let thumbnail = context.paths.thumbnails_dir.join(format!("{hash}.jpg"));
+    match std::fs::metadata(&thumbnail) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => anyhow::bail!(
+            "thumbnail cache path is not a regular file: {}",
+            thumbnail.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let decoded = decode_image(&discovery.path)?;
+            write_thumbnail(
+                &decoded,
+                &thumbnail,
+                context.config.analysis.thumbnail_long_edge,
+            )?;
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect thumbnail cache at {}",
+                    thumbnail.display()
+                )
+            });
+        }
+    }
+    report.unchanged += 1;
+    if context.options.no_ai {
+        report.ai_deferred += 1;
+    }
+    let mutation = if existing.status == ImageStatus::Missing {
+        Some(CatalogMutation::RestoreReady {
+            image_id: existing.id,
+            discovery: discovery.clone(),
         })
-        .transpose()
+    } else {
+        discovery_touch_if_changed(existing, discovery)
+    };
+    Ok(ProcessOutcome::Complete(mutation))
+}
+
+fn discovery_touch_if_changed(
+    existing: &Existing,
+    discovery: &Discovery,
+) -> Option<CatalogMutation> {
+    if existing.source_id != discovery.source_id
+        || existing.size != discovery.size
+        || existing.modified_ns != discovery.modified_ns
+    {
+        return Some(CatalogMutation::Touch {
+            image_id: existing.id,
+            discovery: discovery.clone(),
+        });
+    }
+    None
+}
+
+fn existing_images(database: &Database) -> Result<HashMap<PathBuf, Existing>> {
+    database.with_connection(|connection| {
+        let mut statement = connection.prepare(
+            "SELECT id, source_id, path, size, modified_ns, blake3, status, analysis_key
+             FROM images",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                path_from_bytes(row.get_ref(2)?.as_blob()?),
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(3)? as u64,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (path, id, source_id, size, modified_ns, hash, status, analysis_key) = row?;
+            Ok((
+                path,
+                Existing {
+                    id,
+                    source_id,
+                    size,
+                    modified_ns,
+                    hash,
+                    status: ImageStatus::parse(&status)?,
+                    analysis_key,
+                },
+            ))
+        })
+        .collect()
     })
 }
 
-fn store_analysis(
+fn persist_mutations(
     database: &Database,
+    mutations: &[CatalogMutation],
+    analysis_key: &str,
+) -> Result<()> {
+    if mutations.is_empty() {
+        return Ok(());
+    }
+    database.with_transaction(|transaction| {
+        for mutation in mutations {
+            let result = match mutation {
+                CatalogMutation::Analysis {
+                    discovery,
+                    hash,
+                    thumbnail,
+                    analysis,
+                } => store_analysis(
+                    transaction,
+                    discovery,
+                    hash,
+                    analysis_key,
+                    thumbnail,
+                    analysis,
+                ),
+                CatalogMutation::OutOfBounds {
+                    discovery,
+                    dimensions,
+                } => store_out_of_bounds(transaction, discovery, *dimensions, analysis_key),
+                CatalogMutation::Status {
+                    discovery,
+                    status,
+                    error,
+                    analysis_key,
+                } => store_status(transaction, discovery, *status, error, analysis_key),
+                CatalogMutation::Touch {
+                    image_id,
+                    discovery,
+                } => touch_existing(transaction, *image_id, discovery),
+                CatalogMutation::RestoreReady {
+                    image_id,
+                    discovery,
+                } => restore_ready(transaction, *image_id, discovery),
+            };
+            result.with_context(|| {
+                format!(
+                    "failed to update the catalog for {}",
+                    mutation.discovery().path.display()
+                )
+            })?;
+        }
+        Ok(())
+    })
+}
+
+impl CatalogMutation {
+    const fn discovery(&self) -> &Discovery {
+        match self {
+            Self::Analysis { discovery, .. }
+            | Self::OutOfBounds { discovery, .. }
+            | Self::Status { discovery, .. }
+            | Self::Touch { discovery, .. }
+            | Self::RestoreReady { discovery, .. } => discovery,
+        }
+    }
+}
+
+fn store_analysis(
+    transaction: &Transaction<'_>,
     discovery: &Discovery,
     hash: &str,
     analysis_key: &str,
@@ -324,9 +543,8 @@ fn store_analysis(
     analysis: &ImageAnalysis,
 ) -> Result<()> {
     let now = Utc::now().timestamp_millis();
-    database.with_transaction(|transaction| {
-        transaction.execute(
-            "INSERT INTO images(
+    let mut upsert = transaction.prepare_cached(
+        "INSERT INTO images(
                 source_id, path, size, modified_ns, blake3, status, error, width, height,
                 ratio, orientation, common_ratio, dominant_hex, dominant_name, luminance,
                 saturation, contrast, light_dark, thumbnail_path, analysis_key,
@@ -343,69 +561,63 @@ fn store_analysis(
                 saturation=excluded.saturation, contrast=excluded.contrast,
                 light_dark=excluded.light_dark, thumbnail_path=excluded.thumbnail_path,
                 analysis_key=excluded.analysis_key, updated_at=excluded.updated_at,
-                missing_since=NULL",
-            params![
-                discovery.source_id,
-                path_bytes(&discovery.path),
-                discovery.size as i64,
-                discovery.modified_ns,
-                hash,
-                analysis.width,
-                analysis.height,
-                analysis.ratio,
-                analysis.orientation.as_str(),
-                analysis.common_ratio,
-                analysis.dominant_hex,
-                analysis.dominant_name,
-                analysis.luminance,
-                analysis.saturation,
-                analysis.contrast,
-                analysis.light_dark.as_str(),
-                path_bytes(thumbnail),
-                analysis_key,
-                now,
-            ],
-        )?;
-        let image_id: i64 = transaction.query_row(
-            "SELECT id FROM images WHERE path = ?1",
-            [path_bytes(&discovery.path)],
-            |row| row.get(0),
-        )?;
-        transaction.execute("DELETE FROM image_palette WHERE image_id = ?1", [image_id])?;
-        for (rank, colour) in analysis.palette.iter().enumerate() {
-            transaction.execute(
-                "INSERT INTO image_palette(
-                    image_id, rank, oklab_l, oklab_a, oklab_b, proportion, hex, name
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    image_id,
-                    rank as i64,
-                    colour.oklab.l,
-                    colour.oklab.a,
-                    colour.oklab.b,
-                    colour.proportion,
-                    colour.hex,
-                    colour.name,
-                ],
-            )?;
-        }
-        // A changed image invalidates its prior embedding and derived scores.
-        transaction.execute("DELETE FROM embeddings WHERE image_id = ?1", [image_id])?;
-        transaction.execute("DELETE FROM label_scores WHERE image_id = ?1", [image_id])?;
-        Ok(())
-    })
+                missing_since=NULL
+             RETURNING id",
+    )?;
+    let image_id = upsert.query_row(
+        params![
+            discovery.source_id,
+            path_bytes(&discovery.path),
+            discovery.size as i64,
+            discovery.modified_ns,
+            hash,
+            analysis.width,
+            analysis.height,
+            analysis.ratio,
+            analysis.orientation.as_str(),
+            analysis.common_ratio,
+            analysis.dominant_hex,
+            analysis.dominant_name,
+            analysis.luminance,
+            analysis.saturation,
+            analysis.contrast,
+            analysis.light_dark.as_str(),
+            path_bytes(thumbnail),
+            analysis_key,
+            now,
+        ],
+        |row| row.get(0),
+    )?;
+    clear_derived_data(transaction, image_id)?;
+    let mut insert_palette = transaction.prepare_cached(
+        "INSERT INTO image_palette(
+            image_id, rank, oklab_l, oklab_a, oklab_b, proportion, hex, name
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    )?;
+    for (rank, colour) in analysis.palette.iter().enumerate() {
+        insert_palette.execute(params![
+            image_id,
+            rank as i64,
+            colour.oklab.l,
+            colour.oklab.a,
+            colour.oklab.b,
+            colour.proportion,
+            colour.hex,
+            colour.name,
+        ])?;
+    }
+    Ok(())
 }
 
 fn store_out_of_bounds(
-    database: &Database,
+    transaction: &Transaction<'_>,
     discovery: &Discovery,
     dimensions: (u32, u32),
     analysis_key: &str,
 ) -> Result<()> {
     let now = Utc::now().timestamp_millis();
-    database.with_transaction(|transaction| {
-        transaction.execute(
-            "INSERT INTO images(
+    let mut upsert = transaction.prepare_cached(
+        "INSERT INTO images(
                 source_id, path, size, modified_ns, status, width, height, analysis_key,
                 discovered_at, updated_at
              ) VALUES (?1, ?2, ?3, ?4, 'out_of_bounds', ?5, ?6, ?7, ?8, ?8)
@@ -416,60 +628,35 @@ fn store_out_of_bounds(
                 dominant_hex=NULL, dominant_name=NULL, luminance=NULL, saturation=NULL,
                 contrast=NULL, light_dark=NULL, thumbnail_path=NULL,
                 analysis_key=excluded.analysis_key, updated_at=excluded.updated_at,
-                missing_since=NULL",
-            params![
-                discovery.source_id,
-                path_bytes(&discovery.path),
-                discovery.size as i64,
-                discovery.modified_ns,
-                dimensions.0,
-                dimensions.1,
-                analysis_key,
-                now,
-            ],
-        )?;
-        let image_id: i64 = transaction.query_row(
-            "SELECT id FROM images WHERE path=?1",
-            [path_bytes(&discovery.path)],
-            |row| row.get(0),
-        )?;
-        transaction.execute("DELETE FROM image_palette WHERE image_id=?1", [image_id])?;
-        transaction.execute("DELETE FROM embeddings WHERE image_id=?1", [image_id])?;
-        transaction.execute("DELETE FROM label_scores WHERE image_id=?1", [image_id])?;
-        Ok(())
-    })
-}
-
-fn store_corrupt(
-    database: &Database,
-    discovery: &Discovery,
-    error: &str,
-    analysis_key: &str,
-) -> Result<()> {
-    store_status(
-        database,
-        discovery,
-        ImageStatus::Corrupt,
-        error,
-        analysis_key,
-    )
-}
-
-fn store_failure(database: &Database, discovery: &Discovery, error: &str) -> Result<()> {
-    store_status(database, discovery, ImageStatus::Error, error, "")
+                missing_since=NULL
+             RETURNING id",
+    )?;
+    let image_id = upsert.query_row(
+        params![
+            discovery.source_id,
+            path_bytes(&discovery.path),
+            discovery.size as i64,
+            discovery.modified_ns,
+            dimensions.0,
+            dimensions.1,
+            analysis_key,
+            now,
+        ],
+        |row| row.get(0),
+    )?;
+    clear_derived_data(transaction, image_id)
 }
 
 fn store_status(
-    database: &Database,
+    transaction: &Transaction<'_>,
     discovery: &Discovery,
     status: ImageStatus,
     error: &str,
     analysis_key: &str,
 ) -> Result<()> {
     let now = Utc::now().timestamp_millis();
-    database.with_transaction(|transaction| {
-        transaction.execute(
-            "INSERT INTO images(
+    let mut upsert = transaction.prepare_cached(
+        "INSERT INTO images(
                 source_id, path, size, modified_ns, status, error, analysis_key,
                 discovered_at, updated_at
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
@@ -479,81 +666,94 @@ fn store_status(
                 blake3=NULL, width=NULL, height=NULL, ratio=NULL, orientation=NULL,
                 common_ratio=NULL, dominant_hex=NULL, dominant_name=NULL, luminance=NULL,
                 saturation=NULL, contrast=NULL, light_dark=NULL, thumbnail_path=NULL,
-                updated_at=excluded.updated_at, missing_since=NULL",
-            params![
-                discovery.source_id,
-                path_bytes(&discovery.path),
-                discovery.size as i64,
-                discovery.modified_ns,
-                status.as_str(),
-                error,
-                analysis_key,
-                now,
-            ],
-        )?;
-        let image_id: i64 = transaction.query_row(
-            "SELECT id FROM images WHERE path=?1",
-            [path_bytes(&discovery.path)],
-            |row| row.get(0),
-        )?;
-        transaction.execute("DELETE FROM image_palette WHERE image_id=?1", [image_id])?;
-        transaction.execute("DELETE FROM embeddings WHERE image_id=?1", [image_id])?;
-        transaction.execute("DELETE FROM label_scores WHERE image_id=?1", [image_id])?;
-        Ok(())
-    })
+                updated_at=excluded.updated_at, missing_since=NULL
+             RETURNING id",
+    )?;
+    let image_id = upsert.query_row(
+        params![
+            discovery.source_id,
+            path_bytes(&discovery.path),
+            discovery.size as i64,
+            discovery.modified_ns,
+            status.as_str(),
+            error,
+            analysis_key,
+            now,
+        ],
+        |row| row.get(0),
+    )?;
+    clear_derived_data(transaction, image_id)
 }
 
-fn touch_existing(database: &Database, id: i64, discovery: &Discovery) -> Result<()> {
-    database.with_connection(|connection| {
-        connection.execute(
+fn clear_derived_data(transaction: &Transaction<'_>, image_id: i64) -> Result<()> {
+    transaction
+        .prepare_cached("DELETE FROM image_palette WHERE image_id=?1")?
+        .execute([image_id])?;
+    transaction
+        .prepare_cached("DELETE FROM embeddings WHERE image_id=?1")?
+        .execute([image_id])?;
+    transaction
+        .prepare_cached("DELETE FROM label_scores WHERE image_id=?1")?
+        .execute([image_id])?;
+    Ok(())
+}
+
+fn touch_existing(transaction: &Transaction<'_>, id: i64, discovery: &Discovery) -> Result<()> {
+    transaction
+        .prepare_cached(
             "UPDATE images SET source_id=?1, size=?2, modified_ns=?3, updated_at=?4,
              missing_since=NULL WHERE id=?5",
-            params![
-                discovery.source_id,
-                discovery.size as i64,
-                discovery.modified_ns,
-                Utc::now().timestamp_millis(),
-                id,
-            ],
-        )?;
-        Ok(())
-    })
+        )?
+        .execute(params![
+            discovery.source_id,
+            discovery.size as i64,
+            discovery.modified_ns,
+            Utc::now().timestamp_millis(),
+            id,
+        ])?;
+    Ok(())
+}
+
+fn restore_ready(transaction: &Transaction<'_>, id: i64, discovery: &Discovery) -> Result<()> {
+    let changed = transaction
+        .prepare_cached(
+            "UPDATE images SET source_id=?1, size=?2, modified_ns=?3, status='ready',
+             error=NULL, missing_since=NULL, updated_at=?4 WHERE id=?5",
+        )?
+        .execute(params![
+            discovery.source_id,
+            discovery.size as i64,
+            discovery.modified_ns,
+            Utc::now().timestamp_millis(),
+            id,
+        ])?;
+    anyhow::ensure!(
+        changed == 1,
+        "missing image disappeared while being restored"
+    );
+    Ok(())
 }
 
 fn mark_missing(
     database: &Database,
-    seen: &HashSet<PathBuf>,
     sources: &[SourceRoot],
     unreliable_sources: &HashSet<i64>,
+    existing: &HashMap<PathBuf, Existing>,
 ) -> Result<usize> {
     database.with_transaction(|transaction| {
-        let candidates = {
-            let mut statement =
-                transaction.prepare("SELECT id, path, status, source_id FROM images")?;
-            let rows = statement.query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    path_from_bytes(row.get_ref(1)?.as_blob()?),
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                ))
-            })?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        };
         let now = Utc::now().timestamp_millis();
         let mut changed = 0;
-        for (id, path, status, source_id) in candidates {
-            let belongs_to_source = sources
+        for (path, record) in existing {
+            let owner = sources
                 .iter()
-                .any(|source| path.starts_with(&source.path));
-            if belongs_to_source
-                && !unreliable_sources.contains(&source_id)
-                && !seen.contains(&path)
-                && status != ImageStatus::Missing.as_str()
+                .filter(|source| path.starts_with(&source.path))
+                .max_by_key(|source| source.path.components().count());
+            if owner.is_some_and(|source| !unreliable_sources.contains(&source.id))
+                && record.status != ImageStatus::Missing
             {
                 transaction.execute(
                     "UPDATE images SET status='missing', missing_since=?1, updated_at=?1 WHERE id=?2",
-                    params![now, id],
+                    params![now, record.id],
                 )?;
                 changed += 1;
             }
@@ -565,14 +765,6 @@ fn mark_missing(
 fn analysis_key(config: &Config) -> Result<String> {
     let data = serde_json::to_vec(&(&config.import, &config.analysis))?;
     Ok(blake3::hash(&data).to_hex().to_string())
-}
-
-fn hash_file(path: &Path) -> Result<String> {
-    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let mut reader = BufReader::new(file);
-    let mut hasher = blake3::Hasher::new();
-    std::io::copy(&mut reader, &mut hasher)?;
-    Ok(hasher.finalize().to_hex().to_string())
 }
 
 fn is_supported_image(path: &Path) -> bool {
@@ -653,6 +845,10 @@ mod tests {
         )
         .expect("first scan");
         assert_eq!(first.analyzed, 1);
+        let changes_before = fixture
+            .database
+            .with_connection(|connection| Ok(connection.total_changes()))
+            .expect("change count");
         let second = scan_catalog(
             &fixture.database,
             &fixture.paths,
@@ -662,6 +858,189 @@ mod tests {
         .expect("second scan");
         assert_eq!(second.unchanged, 1);
         assert_eq!(second.analyzed, 0);
+        let changes_after = fixture
+            .database
+            .with_connection(|connection| Ok(connection.total_changes()))
+            .expect("change count");
+        assert_eq!(changes_after, changes_before);
+    }
+
+    #[test]
+    fn incremental_scan_repairs_a_missing_thumbnail_without_reanalysis() {
+        let fixture = Fixture::new();
+        let path = fixture.image("thumbnail.png", 64, 32);
+        scan_catalog(
+            &fixture.database,
+            &fixture.paths,
+            &Config::default(),
+            ScanOptions::default(),
+        )
+        .expect("first scan");
+        let image_id = fixture
+            .database
+            .image_id_by_path(&path)
+            .expect("lookup")
+            .expect("image id");
+        let thumbnail = fixture
+            .database
+            .get_image(image_id)
+            .expect("load")
+            .expect("image")
+            .thumbnail_path
+            .expect("thumbnail path");
+        std::fs::remove_file(&thumbnail).expect("remove thumbnail");
+
+        let report = scan_catalog(
+            &fixture.database,
+            &fixture.paths,
+            &Config::default(),
+            ScanOptions::default(),
+        )
+        .expect("repair scan");
+
+        assert_eq!(report.unchanged, 1);
+        assert_eq!(report.analyzed, 0);
+        assert!(thumbnail.is_file());
+    }
+
+    #[test]
+    fn scan_persists_more_than_one_write_batch() {
+        const IMAGE_COUNT: usize = 65;
+
+        let fixture = Fixture::new();
+        for index in 0..IMAGE_COUNT {
+            fixture.image(&format!("image-{index:03}.png"), 8, 4);
+        }
+
+        let report = scan_catalog(
+            &fixture.database,
+            &fixture.paths,
+            &Config::default(),
+            ScanOptions::default(),
+        )
+        .expect("scan");
+        assert_eq!(report.analyzed, IMAGE_COUNT);
+        let ready = fixture
+            .database
+            .with_connection(|connection| {
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM images WHERE status='ready'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(Into::into)
+            })
+            .expect("ready count");
+        assert_eq!(ready, IMAGE_COUNT as i64);
+    }
+
+    #[test]
+    fn metadata_only_change_reuses_matching_content_analysis() {
+        let fixture = Fixture::new();
+        let path = fixture.image("touched.png", 64, 32);
+        scan_catalog(
+            &fixture.database,
+            &fixture.paths,
+            &Config::default(),
+            ScanOptions::default(),
+        )
+        .expect("first scan");
+        let id = fixture
+            .database
+            .image_id_by_path(&path)
+            .expect("lookup")
+            .expect("image id");
+        let original = fixture.database.get_image(id).expect("get").expect("image");
+
+        let modified = std::fs::metadata(&path)
+            .expect("metadata")
+            .modified()
+            .expect("modified time");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open image")
+            .set_modified(modified + std::time::Duration::from_secs(1))
+            .expect("touch image");
+
+        let report = scan_catalog(
+            &fixture.database,
+            &fixture.paths,
+            &Config::default(),
+            ScanOptions::default(),
+        )
+        .expect("rescan");
+        let updated = fixture.database.get_image(id).expect("get").expect("image");
+        assert_eq!(report.unchanged, 1);
+        assert_eq!(report.analyzed, 0);
+        assert_eq!(updated.hash, original.hash);
+        assert_ne!(updated.modified_ns, original.modified_ns);
+    }
+
+    #[test]
+    fn full_scan_reanalyses_metadata_stable_images() {
+        let fixture = Fixture::new();
+        fixture.image("full.png", 64, 32);
+        scan_catalog(
+            &fixture.database,
+            &fixture.paths,
+            &Config::default(),
+            ScanOptions::default(),
+        )
+        .expect("first scan");
+
+        let report = scan_catalog(
+            &fixture.database,
+            &fixture.paths,
+            &Config::default(),
+            ScanOptions {
+                full: true,
+                no_ai: false,
+            },
+        )
+        .expect("full scan");
+        assert_eq!(report.analyzed, 1);
+        assert_eq!(report.unchanged, 0);
+    }
+
+    #[test]
+    fn analysis_setting_change_invalidates_metadata_fast_path() {
+        let fixture = Fixture::new();
+        let path = fixture.image("settings.png", 64, 32);
+        scan_catalog(
+            &fixture.database,
+            &fixture.paths,
+            &Config::default(),
+            ScanOptions::default(),
+        )
+        .expect("first scan");
+        let id = fixture
+            .database
+            .image_id_by_path(&path)
+            .expect("lookup")
+            .expect("image id");
+        let original_hash = fixture
+            .database
+            .get_image(id)
+            .expect("get")
+            .expect("image")
+            .hash;
+        let mut config = Config::default();
+        config.analysis.dark_threshold = 0.0;
+
+        let report = scan_catalog(
+            &fixture.database,
+            &fixture.paths,
+            &config,
+            ScanOptions::default(),
+        )
+        .expect("rescan");
+        let updated = fixture.database.get_image(id).expect("get").expect("image");
+        assert_eq!(report.analyzed, 1);
+        assert_eq!(report.unchanged, 0);
+        assert_eq!(updated.hash, original_hash);
+        assert_eq!(updated.light_dark.as_deref(), Some("light"));
     }
 
     #[test]
@@ -709,6 +1088,67 @@ mod tests {
                 .status,
             ImageStatus::Missing
         );
+    }
+
+    #[test]
+    fn byte_identical_reappearing_image_reuses_retained_analysis() {
+        let fixture = Fixture::new();
+        let path = fixture.image("returns.png", 64, 32);
+        scan_catalog(
+            &fixture.database,
+            &fixture.paths,
+            &Config::default(),
+            ScanOptions::default(),
+        )
+        .expect("initial scan");
+        let id = fixture
+            .database
+            .image_id_by_path(&path)
+            .expect("lookup")
+            .expect("id");
+        let original = fixture
+            .database
+            .get_image(id)
+            .expect("load")
+            .expect("image");
+        let held = fixture._directory.path().join("held.png");
+        std::fs::rename(&path, &held).expect("hide image");
+        scan_catalog(
+            &fixture.database,
+            &fixture.paths,
+            &Config::default(),
+            ScanOptions::default(),
+        )
+        .expect("missing scan");
+        assert_eq!(
+            fixture
+                .database
+                .get_image(id)
+                .expect("load")
+                .expect("image")
+                .status,
+            ImageStatus::Missing
+        );
+        std::fs::rename(&held, &path).expect("restore image");
+
+        let report = scan_catalog(
+            &fixture.database,
+            &fixture.paths,
+            &Config::default(),
+            ScanOptions::default(),
+        )
+        .expect("reappearance scan");
+        let restored = fixture
+            .database
+            .get_image(id)
+            .expect("load")
+            .expect("image");
+        assert_eq!(report.unchanged, 1);
+        assert_eq!(report.analyzed, 0);
+        assert_eq!(restored.status, ImageStatus::Ready);
+        assert_eq!(restored.hash, original.hash);
+        assert_eq!(restored.palette, original.palette);
+        assert_eq!(restored.thumbnail_path, original.thumbnail_path);
     }
 
     #[test]
@@ -834,6 +1274,57 @@ mod tests {
                 .source_id,
             inner_source.id
         );
+    }
+
+    #[test]
+    fn unavailable_nested_root_does_not_mark_outer_owned_rows_missing() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path();
+        let paths = AppPaths::from_xdg_roots(
+            root.join("config"),
+            root.join("data"),
+            root.join("cache"),
+            root.join("state"),
+        );
+        paths.ensure_owned_dirs().expect("paths");
+        let outer = root.join("images");
+        let inner = outer.join("featured");
+        std::fs::create_dir_all(&inner).expect("roots");
+        let image = inner.join("wall.png");
+        RgbImage::from_pixel(12, 8, Rgb([10, 20, 30]))
+            .save(&image)
+            .expect("image");
+        let database = Database::open(&paths.database).expect("database");
+        database.add_source(&outer).expect("outer");
+        scan_catalog(
+            &database,
+            &paths,
+            &Config::default(),
+            ScanOptions::default(),
+        )
+        .expect("initial scan");
+        let id = database
+            .image_id_by_path(&image)
+            .expect("lookup")
+            .expect("id");
+        database.add_source(&inner).expect("inner");
+
+        let unavailable = root.join("temporarily-unavailable-featured");
+        std::fs::rename(&inner, &unavailable).expect("hide inner root");
+        let report = scan_catalog(
+            &database,
+            &paths,
+            &Config::default(),
+            ScanOptions::default(),
+        )
+        .expect("scan unavailable inner root");
+        assert!(report.failed >= 1);
+        assert_eq!(report.missing, 0);
+        assert_eq!(
+            database.get_image(id).expect("load").expect("image").status,
+            ImageStatus::Ready
+        );
+        std::fs::rename(unavailable, &inner).expect("restore inner root");
     }
 
     #[test]
