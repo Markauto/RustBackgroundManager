@@ -45,6 +45,8 @@ bgm model install --yes
 
 The model and immutable Hugging Face revision are recorded in `config.toml`; v1 rejects unpinned alternatives.
 
+You can also complete the catalog setup without leaving the TUI: press `a` to register a wallpaper directory, then `s` to scan it. Empty screens distinguish an unconfigured catalog, a source waiting to be scanned, scan/import problems, and a filter with no matches, and show the relevant recovery action.
+
 ## Search and collections
 
 Every search surface uses the same versioned `FilterSpecV1`. Different facets are combined with AND; repeated values within one facet are combined with OR.
@@ -116,14 +118,16 @@ Scans, moves, label/tag/favorite changes, and collection updates refresh active 
 ## TUI keys
 
 - `↑`/`↓`, `j`/`k`, Page Up/Down, Home/End: navigate results
+- `a`: add a wallpaper source directory
+- `s`: scan registered sources in the background
 - `:`: open the command palette and run any non-TUI `bgm` command
 - `/`: open the filter editor with built-in examples, saved presets, and full `FilterSpecV1` JSON
+- `r`: clear the active filter and show all searchable wallpapers
 - `f`: toggle favorite
-- `t`: add a tag
+- `t`: add a tag, or enter `remove TAG` to remove one
 - `c`: save, load, list, or delete collections
 - `m`: preview and confirm a move for the selected image
 - `w`: bind or unbind a wpaperd display
-- `s`: run scan and optional GPU analysis off the UI thread
 - `o` or Enter: open the original with `xdg-open`
 - `?`: help; `q`: quit
 

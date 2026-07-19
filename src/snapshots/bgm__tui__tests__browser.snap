@@ -33,4 +33,4 @@ expression: snapshot
 │                                       ││                                              ││                             │
 └───────────────────────────────────────┘└──────────────────────────────────────────────┘└─────────────────────────────┘
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-↑/↓ navigate  / filter  : commands  f favorite  t tag  c collection  m move  w bind  s scan  o open  ? help  q quit
+↑/↓ nav  / filter  r reset  a add  s scan  : cmd  f fave  t tag  c collections  m move  w bind  o open  ? help  q quit

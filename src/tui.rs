@@ -10,8 +10,7 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 use crossterm::{
     cursor::Show,
     event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEvent, KeyModifiers,
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -35,11 +34,11 @@ use crate::{
         command_suggestions, command_value_suggestion, parse_tui_command_line,
     },
     collection::{
-        SavedCollection, add_tag, delete_collection, get_collection, list_collections,
+        SavedCollection, add_tag, delete_collection, get_collection, list_collections, remove_tag,
         save_collection, search_resolved, set_favorite,
     },
     config::Config,
-    db::{Database, ImageRecord},
+    db::{CatalogSummary, Database, ImageRecord},
     filter::{ColourFilter, FilterSpecV1},
     filter_completion::{FilterJsonCompletion, filter_json_completions},
     model,
@@ -50,6 +49,7 @@ use crate::{
 
 #[derive(Clone, Copy)]
 enum InputAction {
+    Source,
     Tag,
     Collection,
     Move,
@@ -59,7 +59,11 @@ enum InputAction {
 enum Mode {
     Browse,
     FilterEditor(FilterEditor),
-    Input { action: InputAction, value: String },
+    Input {
+        action: InputAction,
+        value: String,
+        error: Option<String>,
+    },
     CommandPalette(CommandPalette),
     CommandOutput(CommandOutput),
     ConfirmMove(MovePlan),
@@ -1225,6 +1229,29 @@ enum MoveBackgroundResult {
     Failed(String),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EmptyState {
+    NoSources,
+    NeedsScan,
+    NoReadyImages,
+    NoMatches,
+}
+
+fn initial_status(catalog: CatalogSummary) -> String {
+    match catalog {
+        CatalogSummary { sources: 0, .. } => {
+            "Welcome — press a to add your first wallpaper folder".into()
+        }
+        CatalogSummary { images: 0, .. } => {
+            "Catalog is empty — press s to scan registered sources".into()
+        }
+        CatalogSummary {
+            ready_images: 0, ..
+        } => "No searchable wallpapers — run `: scan --no-ai` to review failures".into(),
+        _ => "Ready — ? for help".into(),
+    }
+}
+
 struct PreviewRequest {
     image_id: i64,
     path: PathBuf,
@@ -1273,6 +1300,7 @@ struct App {
     images: Vec<ImageRecord>,
     selected: usize,
     filter: FilterSpecV1,
+    catalog: CatalogSummary,
     mode: Mode,
     status: String,
     picker: Picker,
@@ -1306,6 +1334,7 @@ impl App {
             .into_iter()
             .map(|result| result.image)
             .collect();
+        let catalog = database.catalog_summary()?;
         let picker = if std::env::var_os("KITTY_WINDOW_ID").is_some()
             || std::env::var("TERM").is_ok_and(|term| term.contains("kitty"))
         {
@@ -1317,8 +1346,9 @@ impl App {
             images,
             selected: 0,
             filter,
+            catalog,
             mode: Mode::Browse,
-            status: "Ready — ? for help".into(),
+            status: initial_status(catalog),
             picker,
             preview: None,
             preview_id: None,
@@ -1350,6 +1380,21 @@ impl App {
         self.images.get(self.selected)
     }
 
+    fn empty_state(&self) -> Option<EmptyState> {
+        if !self.images.is_empty() {
+            return None;
+        }
+        Some(if self.catalog.sources == 0 {
+            EmptyState::NoSources
+        } else if self.catalog.images == 0 {
+            EmptyState::NeedsScan
+        } else if self.catalog.ready_images == 0 {
+            EmptyState::NoReadyImages
+        } else {
+            EmptyState::NoMatches
+        })
+    }
+
     fn ensure_catalog_mutation_idle(&self) -> Result<()> {
         if self.semantic_receiver.is_some() {
             anyhow::bail!("wait for the semantic filter refresh before changing the catalog");
@@ -1371,6 +1416,7 @@ impl App {
 
     fn reload(&mut self, database: &Database, paths: &AppPaths) -> Result<()> {
         let selected_id = self.selected().map(|image| image.id);
+        self.catalog = database.catalog_summary()?;
         if self.semantic_receiver.is_some() {
             anyhow::bail!("wait for the semantic filter refresh to finish");
         }
@@ -1660,6 +1706,10 @@ impl App {
         }
         if self.move_receiver.is_some() {
             self.status = "Wait for the background move before scanning".into();
+            return;
+        }
+        if self.catalog.sources == 0 {
+            self.status = "No sources registered — press a to add a wallpaper folder".into();
             return;
         }
         let database_path = database.path().to_owned();
@@ -2026,20 +2076,9 @@ pub fn run(database: &Database, paths: &AppPaths, config: &Config) -> Result<()>
     let mut config = config.clone();
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    if let Err(error) = execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        EnableBracketedPaste
-    ) {
+    if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste) {
         let _ = disable_raw_mode();
-        let _ = execute!(
-            stdout,
-            LeaveAlternateScreen,
-            DisableBracketedPaste,
-            DisableMouseCapture,
-            Show
-        );
+        let _ = execute!(stdout, LeaveAlternateScreen, DisableBracketedPaste, Show);
         return Err(error.into());
     }
     let cleanup = TerminalCleanup;
@@ -2063,7 +2102,6 @@ impl Drop for TerminalCleanup {
             std::io::stdout(),
             LeaveAlternateScreen,
             DisableBracketedPaste,
-            DisableMouseCapture,
             Show
         );
     }
@@ -2119,6 +2157,9 @@ fn handle_key(
     if matches!(&app.mode, Mode::CommandPalette(_)) {
         return handle_command_palette_key(app, key, database);
     }
+    if matches!(&app.mode, Mode::Input { .. }) {
+        return handle_input_key(app, key, database, paths);
+    }
     match &mut app.mode {
         Mode::Browse => handle_browse_key(app, key, database, paths, config),
         Mode::FilterEditor(_) => unreachable!("filter editor handled above"),
@@ -2147,27 +2188,7 @@ fn handle_key(
             app.mode = Mode::Browse;
             Ok(())
         }
-        Mode::Input { action, value } => match key.code {
-            KeyCode::Esc => {
-                app.mode = Mode::Browse;
-                Ok(())
-            }
-            KeyCode::Backspace => {
-                value.pop();
-                Ok(())
-            }
-            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                value.push(character);
-                Ok(())
-            }
-            KeyCode::Enter => {
-                let value = value.trim().to_owned();
-                let action = *action;
-                app.mode = Mode::Browse;
-                submit_input(app, action, value, database, paths)
-            }
-            _ => Ok(()),
-        },
+        Mode::Input { .. } => unreachable!("input dialog handled above"),
         Mode::ConfirmMove(plan) => match key.code {
             KeyCode::Char('y' | 'Y') => {
                 let plan = plan.clone();
@@ -2182,6 +2203,53 @@ fn handle_key(
             _ => Ok(()),
         },
     }
+}
+
+fn handle_input_key(
+    app: &mut App,
+    key: KeyEvent,
+    database: &Database,
+    paths: &AppPaths,
+) -> Result<()> {
+    match key.code {
+        KeyCode::Esc => app.mode = Mode::Browse,
+        KeyCode::Backspace => {
+            if let Mode::Input { value, error, .. } = &mut app.mode {
+                value.pop();
+                *error = None;
+            }
+        }
+        KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Mode::Input { value, error, .. } = &mut app.mode {
+                value.push(character);
+                *error = None;
+            }
+        }
+        KeyCode::Enter => {
+            let (action, value) = match &app.mode {
+                Mode::Input { action, value, .. } => (*action, value.trim().to_owned()),
+                _ => return Ok(()),
+            };
+            match submit_input(app, action, value, database, paths) {
+                Ok(()) => {
+                    if matches!(app.mode, Mode::Input { .. }) {
+                        app.mode = Mode::Browse;
+                    }
+                }
+                Err(error) => {
+                    if let Mode::Input {
+                        error: dialog_error,
+                        ..
+                    } = &mut app.mode
+                    {
+                        *dialog_error = Some(format!("{error:#}"));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn handle_command_palette_key(app: &mut App, key: KeyEvent, database: &Database) -> Result<()> {
@@ -2304,12 +2372,17 @@ fn handle_paste(app: &mut App, value: &str, database: &Database) {
         Mode::FilterEditor(editor) => editor.paste(value),
         Mode::CommandPalette(palette) => palette.paste(value, database),
         Mode::Input {
-            value: input_value, ..
-        } => input_value.extend(
-            value
-                .chars()
-                .filter(|character| !matches!(character, '\r' | '\n') && !character.is_control()),
-        ),
+            value: input_value,
+            error,
+            ..
+        } => {
+            input_value.extend(
+                value.chars().filter(|character| {
+                    !matches!(character, '\r' | '\n') && !character.is_control()
+                }),
+            );
+            *error = None;
+        }
         _ => {}
     }
 }
@@ -2342,6 +2415,13 @@ fn handle_browse_key(
             app.load_preview();
         }
         KeyCode::Char('?') => app.mode = Mode::Help,
+        KeyCode::Char('a') => {
+            app.mode = Mode::Input {
+                action: InputAction::Source,
+                value: String::new(),
+                error: None,
+            };
+        }
         KeyCode::Char(':') => {
             if app.command_receiver.is_some() {
                 app.status = "A command is already running in the background".into();
@@ -2355,28 +2435,41 @@ fn handle_browse_key(
                 list_collections(database)?,
             ));
         }
+        KeyCode::Char('r') => reset_filter(app, database, paths)?,
         KeyCode::Char('t') => {
-            app.mode = Mode::Input {
-                action: InputAction::Tag,
-                value: String::new(),
-            };
+            if app.selected().is_some() {
+                app.mode = Mode::Input {
+                    action: InputAction::Tag,
+                    value: String::new(),
+                    error: None,
+                };
+            } else {
+                app.status = selection_required_status(app, "tag");
+            }
         }
         KeyCode::Char('c') => {
             app.mode = Mode::Input {
                 action: InputAction::Collection,
                 value: String::new(),
+                error: None,
             };
         }
         KeyCode::Char('m') => {
-            app.mode = Mode::Input {
-                action: InputAction::Move,
-                value: String::new(),
-            };
+            if app.selected().is_some() {
+                app.mode = Mode::Input {
+                    action: InputAction::Move,
+                    value: String::new(),
+                    error: None,
+                };
+            } else {
+                app.status = selection_required_status(app, "move");
+            }
         }
         KeyCode::Char('w') => {
             app.mode = Mode::Input {
                 action: InputAction::Bind,
                 value: "any ".into(),
+                error: None,
             };
         }
         KeyCode::Char('f') => {
@@ -2391,6 +2484,8 @@ fn handle_browse_key(
                     "Removed favorite".into()
                 };
                 app.start_wpaperd_refresh(database, paths);
+            } else {
+                app.status = selection_required_status(app, "favorite");
             }
         }
         KeyCode::Char('o') | KeyCode::Enter => {
@@ -2400,6 +2495,8 @@ fn handle_browse_key(
                     .spawn()
                     .context("failed to start xdg-open")?;
                 app.status = format!("Opened {}", image.path.display());
+            } else {
+                app.status = selection_required_status(app, "open");
             }
         }
         KeyCode::Char('s') => app.start_scan(database, paths, config),
@@ -2413,6 +2510,43 @@ fn open_command_palette(app: &mut App, database: &Database) {
     app.mode = Mode::CommandPalette(palette);
 }
 
+fn reset_filter(app: &mut App, database: &Database, paths: &AppPaths) -> Result<()> {
+    if app.filter == FilterSpecV1::default() {
+        app.status = if app.catalog.ready_images == 0 {
+            initial_status(app.catalog)
+        } else {
+            "Already showing all wallpapers".into()
+        };
+        return Ok(());
+    }
+    app.ensure_catalog_mutation_idle()?;
+    let previous_filter = std::mem::take(&mut app.filter);
+    if let Err(error) = app.reload(database, paths) {
+        app.filter = previous_filter;
+        return Err(error);
+    }
+    app.status = format!("Filter cleared — showing {} wallpaper(s)", app.images.len());
+    Ok(())
+}
+
+fn selection_required_status(app: &App, action: &str) -> String {
+    match app.empty_state() {
+        Some(EmptyState::NoSources) => {
+            format!("Nothing to {action} yet — press a to add a wallpaper folder")
+        }
+        Some(EmptyState::NeedsScan) => {
+            format!("Nothing to {action} yet — press s to scan registered sources")
+        }
+        Some(EmptyState::NoReadyImages) => {
+            format!("Nothing to {action} — review failures with `: scan --no-ai`")
+        }
+        Some(EmptyState::NoMatches) => {
+            format!("No matching wallpaper to {action} — press r to clear the filter")
+        }
+        None => format!("Select a wallpaper to {action}"),
+    }
+}
+
 fn submit_input(
     app: &mut App,
     action: InputAction,
@@ -2421,16 +2555,38 @@ fn submit_input(
     paths: &AppPaths,
 ) -> Result<()> {
     match action {
+        InputAction::Source => {
+            anyhow::ensure!(
+                !value.is_empty(),
+                "type the directory containing your wallpapers"
+            );
+            app.ensure_catalog_mutation_idle()?;
+            let source = database.add_source(&expand_home_path(&value))?;
+            app.catalog = database.catalog_summary()?;
+            app.status = format!("Registered {} — press s to scan it", source.path.display());
+        }
         InputAction::Tag => {
-            if !value.is_empty()
-                && let Some(image) = app.selected()
-            {
-                app.ensure_catalog_mutation_idle()?;
-                add_tag(database, &[image.id], &value)?;
+            anyhow::ensure!(!value.is_empty(), "type a tag, or `remove TAG`");
+            let image_id = app
+                .selected()
+                .map(|image| image.id)
+                .context("select a wallpaper before changing tags")?;
+            app.ensure_catalog_mutation_idle()?;
+            if let Some(tag) = value.strip_prefix("remove ").map(str::trim) {
+                anyhow::ensure!(!tag.is_empty(), "type the tag to remove after `remove`");
+                let changed = remove_tag(database, &[image_id], tag)?;
+                app.reload(database, paths)?;
+                app.status = if changed == 0 {
+                    format!("Tag {tag} was not set on this wallpaper")
+                } else {
+                    format!("Removed tag {tag}")
+                };
+            } else {
+                add_tag(database, &[image_id], &value)?;
                 app.reload(database, paths)?;
                 app.status = format!("Added tag {value}");
-                app.start_wpaperd_refresh(database, paths);
             }
+            app.start_wpaperd_refresh(database, paths);
         }
         InputAction::Collection => {
             if value.eq_ignore_ascii_case("list") {
@@ -2472,15 +2628,17 @@ fn submit_input(
                 let collection = save_collection(database, name, &app.filter)?;
                 app.status = format!("Saved collection {}", collection.name);
                 app.start_wpaperd_refresh(database, paths);
+            } else {
+                anyhow::bail!("type a collection name, `load NAME`, `delete NAME`, or `list`");
             }
         }
         InputAction::Move => {
-            if !value.is_empty()
-                && let Some(image) = app.selected()
-            {
-                let plan = plan_move(std::slice::from_ref(image), &PathBuf::from(value))?;
-                app.mode = Mode::ConfirmMove(plan);
-            }
+            anyhow::ensure!(!value.is_empty(), "type a destination directory");
+            let image = app
+                .selected()
+                .context("select a wallpaper before moving it")?;
+            let plan = plan_move(std::slice::from_ref(image), &expand_home_path(&value))?;
+            app.mode = Mode::ConfirmMove(plan);
         }
         InputAction::Bind => {
             if let Some(display) = value.strip_prefix("unbind ").map(str::trim) {
@@ -2500,6 +2658,27 @@ fn submit_input(
         }
     }
     Ok(())
+}
+
+fn expand_home_path(value: &str) -> PathBuf {
+    let Some(rest) = value.strip_prefix('~') else {
+        return PathBuf::from(value);
+    };
+    if !rest.is_empty() && !rest.starts_with('/') {
+        return PathBuf::from(value);
+    }
+    std::env::var_os("HOME").map_or_else(
+        || PathBuf::from(value),
+        |home| {
+            let mut path = PathBuf::from(home);
+            if let Some(rest) = rest.strip_prefix('/')
+                && !rest.is_empty()
+            {
+                path.push(rest);
+            }
+            path
+        },
+    )
 }
 
 fn refresh_wpaperd_warning(database: &Database, paths: &AppPaths) -> Option<String> {
@@ -2555,9 +2734,40 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
             preview,
         );
     } else {
+        let message = match app.empty_state() {
+            Some(EmptyState::NoSources) => concat!(
+                "Welcome to bgm\n\n",
+                "1. Press a to add a wallpaper folder\n",
+                "2. Press s to scan it\n\n",
+                "Your source images are never modified by a scan."
+            )
+            .into(),
+            Some(EmptyState::NeedsScan) => format!(
+                "Ready to build your catalog\n\nPress s to scan {} registered source{}\n\nThe scan runs in the background.",
+                app.catalog.sources,
+                if app.catalog.sources == 1 { "" } else { "s" }
+            ),
+            Some(EmptyState::NoReadyImages) => concat!(
+                "No searchable wallpapers\n\n",
+                "The scan found files, but none are ready.\n",
+                "Run : scan --no-ai to review failures, and check import bounds."
+            )
+            .into(),
+            Some(EmptyState::NoMatches) => concat!(
+                "No wallpaper matches this filter\n\n",
+                "Press / to edit the filter\n",
+                "Press r to show all wallpapers"
+            )
+            .into(),
+            None if app.preview_requested_id == app.selected().map(|image| image.id) => {
+                "Loading preview…".into()
+            }
+            None => "Preview unavailable\n\nPress Enter or o to open the original".into(),
+        };
         frame.render_widget(
-            Paragraph::new("No preview\n\nPress Enter or o to use xdg-open")
+            Paragraph::new(message)
                 .alignment(Alignment::Center)
+                .wrap(Wrap { trim: false })
                 .block(Block::default().borders(Borders::ALL).title(" Preview ")),
             areas.preview,
         );
@@ -2587,12 +2797,25 @@ fn render_base(frame: &mut Frame<'_>, app: &App) -> ScreenAreas {
         ])
         .split(vertical[1]);
 
-    let title = format!(
-        " bgm — {} wallpaper{} — filter v{} ",
-        app.images.len(),
-        if app.images.len() == 1 { "" } else { "s" },
-        app.filter.version
-    );
+    let result_count = if app.filter == FilterSpecV1::default() {
+        format!(
+            "{} wallpaper{}",
+            app.images.len(),
+            if app.images.len() == 1 { "" } else { "s" }
+        )
+    } else {
+        format!(
+            "{} of {} wallpaper{}",
+            app.images.len(),
+            app.catalog.ready_images,
+            if app.catalog.ready_images == 1 {
+                ""
+            } else {
+                "s"
+            }
+        )
+    };
+    let title = format!(" bgm — {result_count} — filter v{} ", app.filter.version);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
@@ -2607,44 +2830,53 @@ fn render_base(frame: &mut Frame<'_>, app: &App) -> ScreenAreas {
         vertical[0],
     );
 
-    let items: Vec<_> = app
-        .images
-        .iter()
-        .map(|image| {
-            let favorite = if image.favorite { "★" } else { " " };
-            let dimensions = match (image.width, image.height) {
-                (Some(width), Some(height)) => format!("{width}×{height}"),
-                _ => "?×?".into(),
-            };
-            let name = image.path.file_name().map_or_else(
-                || image.path.display().to_string(),
-                |name| name.to_string_lossy().into(),
-            );
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("{favorite} "), Style::default().fg(Color::Yellow)),
-                Span::raw(format!("{name}  ")),
-                Span::styled(dimensions, Style::default().fg(Color::DarkGray)),
-            ]))
-        })
-        .collect();
-    let mut list_state =
-        ListState::default().with_selected((!app.images.is_empty()).then_some(app.selected));
-    frame.render_stateful_widget(
-        List::new(items)
-            .highlight_symbol("▸ ")
-            .highlight_style(
-                Style::default()
-                    .bg(Color::Rgb(35, 48, 65))
-                    .add_modifier(Modifier::BOLD),
-            )
-            .block(Block::default().borders(Borders::ALL).title(" Results ")),
-        body[0],
-        &mut list_state,
-    );
+    if app.images.is_empty() {
+        frame.render_widget(
+            Paragraph::new(empty_results_text(app))
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: false })
+                .block(Block::default().borders(Borders::ALL).title(" Results ")),
+            body[0],
+        );
+    } else {
+        let items: Vec<_> = app
+            .images
+            .iter()
+            .map(|image| {
+                let favorite = if image.favorite { "★" } else { " " };
+                let dimensions = match (image.width, image.height) {
+                    (Some(width), Some(height)) => format!("{width}×{height}"),
+                    _ => "?×?".into(),
+                };
+                let name = image.path.file_name().map_or_else(
+                    || image.path.display().to_string(),
+                    |name| name.to_string_lossy().into(),
+                );
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("{favorite} "), Style::default().fg(Color::Yellow)),
+                    Span::raw(format!("{name}  ")),
+                    Span::styled(dimensions, Style::default().fg(Color::DarkGray)),
+                ]))
+            })
+            .collect();
+        let mut list_state = ListState::default().with_selected(Some(app.selected));
+        frame.render_stateful_widget(
+            List::new(items)
+                .highlight_symbol("▸ ")
+                .highlight_style(
+                    Style::default()
+                        .bg(Color::Rgb(35, 48, 65))
+                        .add_modifier(Modifier::BOLD),
+                )
+                .block(Block::default().borders(Borders::ALL).title(" Results ")),
+            body[0],
+            &mut list_state,
+        );
+    }
 
     let metadata = app
         .selected()
-        .map_or_else(|| Text::from("No matching images"), metadata_text);
+        .map_or_else(|| empty_metadata_text(app), metadata_text);
     frame.render_widget(
         Paragraph::new(metadata).wrap(Wrap { trim: false }).block(
             Block::default()
@@ -2654,14 +2886,14 @@ fn render_base(frame: &mut Frame<'_>, app: &App) -> ScreenAreas {
         body[2],
     );
 
+    let footer = if vertical[2].width >= 108 {
+        "↑/↓ nav  / filter  r reset  a add  s scan  : cmd  f fave  t tag  c collections  m move  w bind  o open  ? help  q quit"
+    } else {
+        "↑/↓ nav  / filter  a add  s scan  : cmd  ? help  q quit"
+    };
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("↑/↓", Style::default().fg(Color::Cyan)),
-            Span::raw(" navigate  "),
-            Span::styled("/", Style::default().fg(Color::Cyan)),
-            Span::raw(" filter  : commands  f favorite  t tag  c collection  m move  w bind  s scan  o open  ? help  q quit"),
-        ]))
-        .block(Block::default().borders(Borders::TOP)),
+        Paragraph::new(Span::styled(footer, Style::default().fg(Color::Cyan)))
+            .block(Block::default().borders(Borders::TOP)),
         vertical[2],
     );
     let status_area = Rect {
@@ -2675,6 +2907,75 @@ fn render_base(frame: &mut Frame<'_>, app: &App) -> ScreenAreas {
         status_area,
     );
     ScreenAreas { preview: body[1] }
+}
+
+fn empty_results_text(app: &App) -> Text<'static> {
+    let lines = match app.empty_state() {
+        Some(EmptyState::NoSources) => vec![
+            Line::from(Span::styled(
+                "No sources yet",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from("Press a to add a folder"),
+            Line::from("then s to scan"),
+        ],
+        Some(EmptyState::NeedsScan) => vec![
+            Line::from(Span::styled(
+                "Catalog is empty",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from("Press s to scan"),
+        ],
+        Some(EmptyState::NoReadyImages) => vec![
+            Line::from(Span::styled(
+                "No ready images",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from("Run : scan --no-ai"),
+            Line::from("and review scan warnings"),
+        ],
+        Some(EmptyState::NoMatches) => vec![
+            Line::from(Span::styled(
+                "No matches",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from("/ edit filter"),
+            Line::from("r show all"),
+        ],
+        None => Vec::new(),
+    };
+    Text::from(lines)
+}
+
+fn empty_metadata_text(app: &App) -> Text<'static> {
+    let message = match app.empty_state() {
+        Some(EmptyState::NoSources) => {
+            "Setup\n\nAdd a source folder with a.\nIts images stay untouched."
+        }
+        Some(EmptyState::NeedsScan) => {
+            "Setup\n\nA source is registered.\nPress s to discover and analyze its images."
+        }
+        Some(EmptyState::NoReadyImages) => {
+            "Catalog status\n\nFiles were discovered, but none are ready to browse.\nCheck import bounds and scan errors."
+        }
+        Some(EmptyState::NoMatches) => {
+            "Filter status\n\nThe catalog has images, but the active filter matched none."
+        }
+        None => "No wallpaper selected",
+    };
+    Text::from(message)
 }
 
 fn metadata_text(image: &ImageRecord) -> Text<'static> {
@@ -2763,20 +3064,28 @@ fn render_modal(frame: &mut Frame<'_>, app: &mut App) {
         Mode::CommandPalette(palette) => render_command_palette(frame, palette),
         Mode::CommandOutput(output) => render_command_output(frame, output),
         Mode::Help => {
-            let area = centered_rect(76, 86, frame.area());
+            let area = centered_fixed_height(82, 26, frame.area());
             frame.render_widget(Clear, area);
             frame.render_widget(
                 Paragraph::new(
-                    "Keyboard\n\n↑/↓, j/k    navigate\n:            run any bgm CLI command\n/            filter examples, presets, and JSON\nf/t/c        favorite, tag, collections\nm/w/s        move, wpaperd binding, background scan\no or Enter   open with xdg-open\nq            quit\n\nCommand palette\nTab / ↑/↓    complete / choose suggestion\nCtrl+P/N     previous / next command in history\n←/→ Home End edit; Ctrl+W deletes a word\nEnter runs in background; Esc closes\n\nFilter editor\nCtrl+Space   show JSON IntelliSense\nTab / ↑/↓    accept / choose suggestion when open\nEnter accepts suggestion or inserts a line\nCtrl+P       save JSON as a named preset\nCtrl+S/R     apply / reset filter\nEsc          close suggestions, then cancel\n\nPress any key to close.",
+                    "Browse\n↑/↓, j/k    navigate\na / s        add a source / scan in background\n/ / r        edit filter / show all wallpapers\nf / t        favorite / add or `remove TAG`\nc / m / w    collections / move / wpaperd binding\n:            run any non-TUI bgm command\no or Enter   open original; q quits\n\nCommand palette\nTab / ↑/↓    complete / choose suggestion\nCtrl+P/N     previous / next command in history\n←/→ Home End edit; Ctrl+W deletes a word\nEnter runs; Esc closes\n\nFilter editor\nCtrl+Space   show JSON IntelliSense\nTab / ↑/↓    accept / choose suggestion\nCtrl+P       save JSON as a named preset\nCtrl+S/R     apply / reset filter; Esc cancels\n\nPress any key to close help.",
                 )
                 .wrap(Wrap { trim: false })
                 .block(Block::default().borders(Borders::ALL).title(" Help ")),
                 area,
             );
         }
-        Mode::Input { action, value } => {
+        Mode::Input {
+            action,
+            value,
+            error,
+        } => {
             let (title, hint) = match action {
-                InputAction::Tag => (" Add tag ", "tag for selected image"),
+                InputAction::Source => (
+                    " Add wallpaper source ",
+                    "directory to scan; ~/ paths are supported",
+                ),
+                InputAction::Tag => (" Change tags ", "TAG to add, or: remove TAG"),
                 InputAction::Collection => (
                     " Manage collections ",
                     "NAME/save NAME, load NAME, delete NAME, or list",
@@ -2787,8 +3096,17 @@ fn render_modal(frame: &mut Frame<'_>, app: &mut App) {
                     "DISPLAY COLLECTION, or: unbind DISPLAY",
                 ),
             };
-            let area = centered_rect(70, 22, frame.area());
+            let area = centered_fixed_height(70, 9, frame.area());
             frame.render_widget(Clear, area);
+            let feedback = error.as_ref().map_or_else(
+                || Line::from(""),
+                |error| {
+                    Line::from(Span::styled(
+                        format!("Error: {error}"),
+                        Style::default().fg(Color::Red),
+                    ))
+                },
+            );
             frame.render_widget(
                 Paragraph::new(vec![
                     Line::from(hint),
@@ -2798,8 +3116,10 @@ fn render_modal(frame: &mut Frame<'_>, app: &mut App) {
                         Style::default().fg(Color::Cyan),
                     )),
                     Line::from(""),
+                    feedback,
                     Line::from("Enter applies • Esc cancels"),
                 ])
+                .wrap(Wrap { trim: false })
                 .block(Block::default().borders(Borders::ALL).title(title)),
                 area,
             );
@@ -3358,6 +3678,18 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(vertical[1])[1]
 }
 
+fn centered_fixed_height(percent_x: u16, height: u16, area: Rect) -> Rect {
+    let width = area.width.saturating_mul(percent_x).saturating_div(100);
+    let width = width.max(1).min(area.width);
+    let height = height.max(1).min(area.height);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
+}
+
 fn parse_terminal_colour(hex: &str) -> Option<Color> {
     let value = hex.strip_prefix('#')?;
     if value.len() != 6 {
@@ -3427,6 +3759,11 @@ mod tests {
             images: vec![mock_image()],
             selected: 0,
             filter: FilterSpecV1::default(),
+            catalog: CatalogSummary {
+                sources: 1,
+                images: 1,
+                ready_images: 1,
+            },
             mode,
             status: "Ready — ? for help".into(),
             picker: Picker::halfblocks(),
@@ -3638,6 +3975,150 @@ mod tests {
         let database = Database::open(&paths.database).expect("database");
         let app = App::new(&database, &paths).expect("app");
         (directory, paths, database, app)
+    }
+
+    fn runtime_with_image() -> (tempfile::TempDir, AppPaths, Database, App) {
+        let (directory, paths, database, _) = empty_runtime();
+        let source = directory.path().join("wallpapers");
+        std::fs::create_dir(&source).expect("source");
+        image::RgbImage::from_pixel(32, 18, image::Rgb([20, 60, 120]))
+            .save(source.join("wall.png"))
+            .expect("image");
+        database.add_source(&source).expect("add source");
+        crate::scan::scan_catalog(
+            &database,
+            &paths,
+            &Config::default(),
+            ScanOptions {
+                full: false,
+                no_ai: true,
+            },
+        )
+        .expect("scan");
+        let app = App::new(&database, &paths).expect("app");
+        (directory, paths, database, app)
+    }
+
+    #[test]
+    fn first_run_screen_explains_how_to_build_the_catalog() {
+        let (_directory, _paths, _database, mut app) = empty_runtime();
+        let backend = TestBackend::new(100, 28);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+
+        let screen = buffer_text(&terminal);
+        assert!(screen.contains("No sources yet"));
+        assert!(screen.contains("Welcome to bgm"));
+        assert!(screen.contains("Press a to add"));
+        assert!(screen.contains("Press s to scan"));
+    }
+
+    #[test]
+    fn help_content_fits_a_standard_small_terminal() {
+        let mut app = mock_app(Mode::Help);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+
+        let screen = buffer_text(&terminal);
+        assert!(screen.contains("Browse"));
+        assert!(screen.contains("Command palette"));
+        assert!(screen.contains("Filter editor"));
+        assert!(screen.contains("Press any key to close help"));
+    }
+
+    #[test]
+    fn source_input_registers_a_folder_and_points_to_scan() {
+        let (directory, paths, database, mut app) = empty_runtime();
+        let source = directory.path().join("wallpapers");
+        std::fs::create_dir(&source).expect("source");
+
+        submit_input(
+            &mut app,
+            InputAction::Source,
+            source.display().to_string(),
+            &database,
+            &paths,
+        )
+        .expect("add source");
+
+        assert_eq!(app.catalog.sources, 1);
+        assert_eq!(database.list_sources().expect("sources").len(), 1);
+        assert!(app.status.contains("press s to scan it"));
+    }
+
+    #[test]
+    fn input_errors_stay_open_and_clear_when_edited() {
+        let (_directory, paths, database, mut app) = empty_runtime();
+        app.mode = Mode::Input {
+            action: InputAction::Source,
+            value: String::new(),
+            error: None,
+        };
+
+        handle_input_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &database,
+            &paths,
+        )
+        .expect("submit invalid input");
+        assert!(matches!(
+            &app.mode,
+            Mode::Input {
+                error: Some(error),
+                ..
+            } if error.contains("type the directory")
+        ));
+
+        handle_input_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            &database,
+            &paths,
+        )
+        .expect("edit input");
+        assert!(matches!(
+            &app.mode,
+            Mode::Input { value, error: None, .. } if value == "/"
+        ));
+    }
+
+    #[test]
+    fn reset_filter_recovers_from_an_empty_result() {
+        let (_directory, paths, database, mut app) = runtime_with_image();
+        app.filter.favorite = Some(true);
+        app.reload(&database, &paths).expect("filtered reload");
+        assert!(app.images.is_empty());
+        assert_eq!(app.empty_state(), Some(EmptyState::NoMatches));
+
+        reset_filter(&mut app, &database, &paths).expect("reset filter");
+
+        assert_eq!(app.filter, FilterSpecV1::default());
+        assert_eq!(app.images.len(), 1);
+        assert!(app.status.contains("Filter cleared"));
+    }
+
+    #[test]
+    fn tag_input_can_remove_an_existing_tag() {
+        let (_directory, paths, database, mut app) = runtime_with_image();
+        let image_id = app.selected().expect("image").id;
+        add_tag(&database, &[image_id], "desktop").expect("tag");
+        app.reload(&database, &paths).expect("tagged reload");
+
+        submit_input(
+            &mut app,
+            InputAction::Tag,
+            "remove desktop".into(),
+            &database,
+            &paths,
+        )
+        .expect("remove tag");
+
+        assert!(app.selected().expect("image").tags.is_empty());
+        assert_eq!(app.status, "Removed tag desktop");
     }
 
     #[test]

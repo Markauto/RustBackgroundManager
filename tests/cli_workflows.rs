@@ -2,6 +2,7 @@ use std::{fs, path::Path};
 
 use assert_cmd::Command;
 use image::{Rgb, RgbImage};
+use predicates::str::contains;
 use serde_json::Value;
 
 struct Fixture {
@@ -90,6 +91,69 @@ fn lightweight_commands_do_not_create_or_open_the_catalog() {
         .assert()
         .success();
     assert!(!database.exists());
+}
+
+#[test]
+fn empty_human_commands_explain_the_next_step() {
+    let fixture = Fixture::new();
+
+    fixture
+        .command()
+        .args(["source", "list"])
+        .assert()
+        .success()
+        .stdout(contains("bgm source add <DIRECTORY>"));
+    fixture
+        .command()
+        .args(["scan", "--no-ai"])
+        .assert()
+        .success()
+        .stdout(contains("No sources registered"));
+    fixture
+        .command()
+        .arg("search")
+        .assert()
+        .success()
+        .stdout(contains("Start with `bgm source add <DIRECTORY>`"));
+    fixture
+        .command()
+        .args(["collection", "list"])
+        .assert()
+        .success()
+        .stdout(contains("bgm collection save <NAME>"));
+    fixture
+        .command()
+        .args(["wpaperd", "status"])
+        .assert()
+        .success()
+        .stdout(contains("bgm wpaperd bind <DISPLAY> <COLLECTION>"));
+}
+
+#[test]
+fn help_text_describes_filters_and_first_run() {
+    let fixture = Fixture::new();
+
+    fixture
+        .command()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(contains("Quick start:"))
+        .stdout(contains("bgm source add ~/Pictures/Wallpapers"));
+    fixture
+        .command()
+        .args(["search", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("Match text anywhere in the image path"))
+        .stdout(contains("normalized luminance"))
+        .stdout(contains("machine-readable JSON"));
+    fixture
+        .command()
+        .args(["move", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("without this flag, only preview it"));
 }
 
 #[test]

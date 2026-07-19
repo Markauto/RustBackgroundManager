@@ -37,7 +37,13 @@ use crate::{
 };
 
 #[derive(Debug, Parser)]
-#[command(name = "bgm", version, about, long_about = None)]
+#[command(
+    name = "bgm",
+    version,
+    about,
+    long_about = None,
+    after_help = "Quick start:\n  bgm source add ~/Pictures/Wallpapers\n  bgm scan --no-ai\n  bgm\n\nRun `bgm doctor` to check optional preview, wpaperd, and ROCm support."
+)]
 pub struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -86,6 +92,7 @@ enum Command {
     Tui,
     /// Check the local environment and bgm state.
     Doctor {
+        /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
     },
@@ -104,8 +111,10 @@ enum Command {
         /// Rehash and reanalyse images even when filesystem metadata is unchanged.
         #[arg(long)]
         full: bool,
+        /// Skip CLIP embedding and label analysis.
         #[arg(long)]
         no_ai: bool,
+        /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
     },
@@ -149,37 +158,53 @@ enum Command {
 enum ConfigCommand {
     /// Show the active configuration.
     Show {
+        /// Emit machine-readable JSON instead of TOML.
         #[arg(long)]
         json: bool,
     },
     /// Set one configuration key.
-    Set { key: String, value: String },
+    Set {
+        /// Dotted configuration key, for example `ai.enabled`.
+        key: String,
+        /// New value in the key's expected format.
+        value: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum SourceCommand {
     /// Register a source directory.
-    Add { directory: PathBuf },
+    Add {
+        /// Existing directory to scan recursively.
+        directory: PathBuf,
+    },
     /// List registered source directories.
     List {
+        /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
     },
     /// Unregister a source directory.
-    Remove { directory: PathBuf },
+    Remove {
+        /// Registered directory to remove from the catalog.
+        directory: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum ModelCommand {
     /// Download and verify the pinned CLIP model.
     Install {
+        /// Download without an interactive confirmation prompt.
         #[arg(long)]
         yes: bool,
     },
     /// Inspect the pinned model installation.
     Status {
+        /// Recompute checksums for every model artifact.
         #[arg(long)]
         verify: bool,
+        /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
     },
@@ -191,22 +216,31 @@ enum ModelCommand {
 enum LabelCommand {
     /// List label packs.
     List {
+        /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
     },
     /// Create or update a label pack.
     Set {
+        /// Pack name used by `--ai PACK=LABEL` filters.
         name: String,
+        /// Descriptive pack kind stored with the labels.
         #[arg(long, default_value = "custom")]
         kind: String,
+        /// Label and optional CLIP prompt; repeat to add multiple prompts.
         #[arg(long = "label", value_name = "NAME[=PROMPT]", required = true)]
         labels: Vec<String>,
     },
     /// Delete a custom label pack.
-    Delete { name: String },
+    Delete {
+        /// Custom pack name to delete.
+        name: String,
+    },
     /// Rescore saved embeddings with one or all label packs.
     Rescore {
+        /// Pack to rescore; omit to rescore every pack.
         name: Option<String>,
+        /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
     },
@@ -216,50 +250,71 @@ enum LabelCommand {
 struct SearchArgs {
     #[command(flatten)]
     filter: FilterArgs,
+    /// Emit full image records as machine-readable JSON.
     #[arg(long)]
     json: bool,
 }
 
 #[derive(Clone, Debug, Default, Args)]
 struct FilterArgs {
+    /// Match a registered source ID; repeat to match any listed source.
     #[arg(long = "source", value_name = "ID")]
     source_ids: Vec<i64>,
+    /// Match text anywhere in the image path; repeat to match any value.
     #[arg(long = "path", value_name = "TEXT")]
     paths: Vec<String>,
+    /// Require at least this many pixels of width.
     #[arg(long)]
     min_width: Option<u32>,
+    /// Require at most this many pixels of width.
     #[arg(long)]
     max_width: Option<u32>,
+    /// Require at least this many pixels of height.
     #[arg(long)]
     min_height: Option<u32>,
+    /// Require at most this many pixels of height.
     #[arg(long)]
     max_height: Option<u32>,
+    /// Match an orientation; repeat to match any listed orientation.
     #[arg(long = "orientation")]
     orientations: Vec<OrientationArg>,
+    /// Match a ratio such as `16:9` or `1.778`; repeat to match any ratio.
     #[arg(long = "ratio", value_name = "RATIO")]
     ratios: Vec<String>,
+    /// Maximum relative difference from each requested aspect ratio.
     #[arg(long, default_value_t = 0.03)]
     ratio_tolerance: f64,
+    /// Match the light/dark estimate; repeat to match either class.
     #[arg(long = "brightness")]
     brightness: Vec<BrightnessArg>,
+    /// Require normalized luminance at or above this value (0 to 1).
     #[arg(long)]
     min_luminance: Option<f32>,
+    /// Require normalized luminance at or below this value (0 to 1).
     #[arg(long)]
     max_luminance: Option<f32>,
+    /// Match the dominant colour within an optional Oklab distance.
     #[arg(long = "dominant-colour", value_name = "HEX[:DISTANCE]")]
     dominant_colours: Vec<String>,
+    /// Match any palette colour within an optional Oklab distance.
     #[arg(long = "palette-colour", value_name = "HEX[:DISTANCE]")]
     palette_colours: Vec<String>,
+    /// Match a CLIP label estimate at an optional minimum score.
     #[arg(long = "ai", value_name = "PACK=LABEL[:SCORE]")]
     ai_labels: Vec<String>,
+    /// Rank images by similarity to arbitrary text (requires ROCm and the model).
     #[arg(long)]
     semantic: Option<String>,
+    /// Require this minimum semantic similarity score.
     #[arg(long)]
     semantic_min_score: Option<f32>,
+    /// Match a custom tag; repeat to match any listed tag.
     #[arg(long = "tag")]
     tags: Vec<String>,
+    /// Match only favorite images.
     #[arg(long, conflicts_with = "not_favorite")]
     favorite: bool,
+    /// Match only images that are not favorites.
     #[arg(long, conflicts_with = "favorite")]
     not_favorite: bool,
 }
@@ -281,36 +336,47 @@ enum BrightnessArg {
 enum CollectionCommand {
     /// Save a filter as a named collection.
     Save {
+        /// Collection name; saving an existing name updates its filter.
         name: String,
         #[command(flatten)]
         filter: Box<FilterArgs>,
     },
     /// List saved collections.
     List {
+        /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
     },
     /// Show one saved collection's filter.
     Show {
+        /// Saved collection name.
         name: String,
+        /// Emit the collection record as machine-readable JSON.
         #[arg(long)]
         json: bool,
     },
     /// Delete a saved collection.
-    Delete { name: String },
+    Delete {
+        /// Saved collection name.
+        name: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum TagCommand {
     /// Add a tag to one or more images.
     Add {
+        /// Tag name to add.
         tag: String,
+        /// Catalog image IDs; repeat or pass several IDs.
         #[arg(required = true)]
         image_ids: Vec<i64>,
     },
     /// Remove a tag from one or more images.
     Remove {
+        /// Tag name to remove.
         tag: String,
+        /// Catalog image IDs; repeat or pass several IDs.
         #[arg(required = true)]
         image_ids: Vec<i64>,
     },
@@ -320,11 +386,13 @@ enum TagCommand {
 enum FavoriteCommand {
     /// Mark one or more images as favorites.
     Set {
+        /// Catalog image IDs; repeat or pass several IDs.
         #[arg(required = true)]
         image_ids: Vec<i64>,
     },
     /// Remove one or more images from favorites.
     Unset {
+        /// Catalog image IDs; repeat or pass several IDs.
         #[arg(required = true)]
         image_ids: Vec<i64>,
     },
@@ -336,14 +404,19 @@ struct MoveArgs {
     action: Option<MoveAction>,
     #[command(flatten)]
     filter: FilterArgs,
+    /// Move these catalog image IDs instead of selecting with filters.
     #[arg(long = "image-id")]
     image_ids: Vec<i64>,
+    /// Explicitly select every searchable image.
     #[arg(long)]
     all: bool,
+    /// Destination directory; filenames are preserved.
     #[arg(long)]
     to: Option<PathBuf>,
+    /// Perform the validated move; without this flag, only preview it.
     #[arg(long)]
     apply: bool,
+    /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
 }
@@ -352,7 +425,9 @@ struct MoveArgs {
 enum MoveAction {
     /// Undo a previously applied move.
     Undo {
+        /// Move operation UUID printed when the move was applied.
         id: Uuid,
+        /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
     },
@@ -361,16 +436,28 @@ enum MoveAction {
 #[derive(Debug, Subcommand)]
 enum WpaperdCommand {
     /// Bind a display to a saved collection.
-    Bind { display: String, collection: String },
+    Bind {
+        /// `any`, `DP-1`, `DP-2`, or `HDMI-A-1`.
+        display: String,
+        /// Non-empty saved collection to materialize.
+        collection: String,
+    },
     /// Refresh one or all managed wallpaper pools.
-    Refresh { display: Option<String> },
+    Refresh {
+        /// Display to refresh; omit to refresh every binding.
+        display: Option<String>,
+    },
     /// Show active wpaperd bindings.
     Status {
+        /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
     },
     /// Remove a display binding.
-    Unbind { display: String },
+    Unbind {
+        /// Bound display to disconnect.
+        display: String,
+    },
 }
 
 pub(crate) fn command_completion_context(input: &str, cursor: usize) -> CommandCompletionContext {
@@ -863,7 +950,7 @@ fn command_source(context: &AppContext, command: SourceCommand) -> Result<()> {
     match command {
         SourceCommand::Add { directory } => {
             let source = context.database.add_source(&directory)?;
-            println!("{}\t{}", source.id, source.path.display());
+            println!("registered source {}: {}", source.id, source.path.display());
             Ok(())
         }
         SourceCommand::List { json } => {
@@ -871,8 +958,12 @@ fn command_source(context: &AppContext, command: SourceCommand) -> Result<()> {
             if json {
                 print_json(&sources)
             } else {
-                for source in sources {
-                    println!("{}\t{}", source.id, source.path.display());
+                if sources.is_empty() {
+                    println!("No sources registered. Add one with `bgm source add <DIRECTORY>`.");
+                } else {
+                    for source in sources {
+                        println!("{}\t{}", source.id, source.path.display());
+                    }
                 }
                 Ok(())
             }
@@ -889,6 +980,12 @@ fn command_source(context: &AppContext, command: SourceCommand) -> Result<()> {
 }
 
 fn command_scan(context: &AppContext, full: bool, no_ai: bool, json: bool) -> Result<()> {
+    if !json && context.database.catalog_summary()?.sources == 0 {
+        println!(
+            "No sources registered. Add a wallpaper folder with `bgm source add <DIRECTORY>`, then scan again."
+        );
+        return Ok(());
+    }
     let report = scan_catalog(
         &context.database,
         &context.paths,
@@ -1029,23 +1126,39 @@ fn command_search(context: &AppContext, arguments: SearchArgs) -> Result<()> {
     if arguments.json {
         print_json(&hits)
     } else {
-        for hit in hits {
-            let dimensions = match (hit.image.width, hit.image.height) {
-                (Some(width), Some(height)) => format!("{width}x{height}"),
-                _ => "?x?".into(),
+        if hits.is_empty() {
+            let catalog = context.database.catalog_summary()?;
+            let message = if catalog.sources == 0 {
+                "No sources registered. Start with `bgm source add <DIRECTORY>`."
+            } else if catalog.images == 0 {
+                "The catalog is empty. Run `bgm scan --no-ai` to discover wallpapers."
+            } else if catalog.ready_images == 0 {
+                "No searchable wallpapers are ready. Run `bgm scan --no-ai` to review failures and `bgm config show` to check import bounds."
+            } else if filter != FilterSpecV1::default() {
+                "No wallpapers matched those filters. Try fewer filters or run `bgm search` to show all."
+            } else {
+                "No searchable wallpapers found."
             };
-            let score = hit
-                .semantic_score
-                .map_or_else(String::new, |score| format!("\tsemantic≈{score:.3}"));
-            let favorite = if hit.image.favorite { "★" } else { " " };
-            println!(
-                "{}\t{}\t{}\t{}{}",
-                hit.image.id,
-                favorite,
-                dimensions,
-                hit.image.path.display(),
-                score
-            );
+            println!("{message}");
+        } else {
+            for hit in hits {
+                let dimensions = match (hit.image.width, hit.image.height) {
+                    (Some(width), Some(height)) => format!("{width}x{height}"),
+                    _ => "?x?".into(),
+                };
+                let score = hit
+                    .semantic_score
+                    .map_or_else(String::new, |score| format!("\tsemantic≈{score:.3}"));
+                let favorite = if hit.image.favorite { "★" } else { " " };
+                println!(
+                    "{}\t{}\t{}\t{}{}",
+                    hit.image.id,
+                    favorite,
+                    dimensions,
+                    hit.image.path.display(),
+                    score
+                );
+            }
         }
         Ok(())
     }
@@ -1064,8 +1177,14 @@ fn command_collection(context: &AppContext, command: CollectionCommand) -> Resul
             if json {
                 print_json(&collections)
             } else {
-                for collection in collections {
-                    println!("{}\t{}", collection.id, collection.name);
+                if collections.is_empty() {
+                    println!(
+                        "No saved collections. Create one with `bgm collection save <NAME> [FILTERS]`."
+                    );
+                } else {
+                    for collection in collections {
+                        println!("{}\t{}", collection.id, collection.name);
+                    }
                 }
                 Ok(())
             }
@@ -1204,13 +1323,19 @@ fn command_wpaperd(context: &AppContext, command: WpaperdCommand) -> Result<()> 
             if json {
                 print_json(&bindings)
             } else {
-                for binding in bindings {
+                if bindings.is_empty() {
                     println!(
-                        "{}\t{}\t{}",
-                        binding.display,
-                        binding.collection_name,
-                        binding.pool_path.display()
+                        "No active wpaperd bindings. Bind one with `bgm wpaperd bind <DISPLAY> <COLLECTION>`."
                     );
+                } else {
+                    for binding in bindings {
+                        println!(
+                            "{}\t{}\t{}",
+                            binding.display,
+                            binding.collection_name,
+                            binding.pool_path.display()
+                        );
+                    }
                 }
                 Ok(())
             }
@@ -1471,6 +1596,25 @@ mod tests {
         ] {
             assert!(names.contains(&required), "missing {required}");
         }
+    }
+
+    #[test]
+    fn every_cli_argument_has_user_facing_help() {
+        fn assert_documented(command: &clap::Command) {
+            for argument in command.get_arguments() {
+                assert!(
+                    argument.get_help().is_some() || argument.get_long_help().is_some(),
+                    "{} argument {} has no help text",
+                    command.get_name(),
+                    argument.get_id()
+                );
+            }
+            for subcommand in command.get_subcommands() {
+                assert_documented(subcommand);
+            }
+        }
+
+        assert_documented(&Cli::command());
     }
 
     #[test]

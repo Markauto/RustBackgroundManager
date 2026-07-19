@@ -34,6 +34,13 @@ pub struct SourceRoot {
     pub added_at: i64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CatalogSummary {
+    pub sources: usize,
+    pub images: usize,
+    pub ready_images: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImageStatus {
@@ -182,6 +189,31 @@ impl Database {
             })?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(Into::into)
+        })
+    }
+
+    pub fn catalog_summary(&self) -> Result<CatalogSummary> {
+        self.with_connection(|connection| {
+            let (sources, images, ready_images) = connection.query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM source_roots),
+                    (SELECT COUNT(*) FROM images),
+                    (SELECT COUNT(*) FROM images WHERE status = 'ready')",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )?;
+            Ok(CatalogSummary {
+                sources: usize::try_from(sources).context("invalid source count in catalog")?,
+                images: usize::try_from(images).context("invalid image count in catalog")?,
+                ready_images: usize::try_from(ready_images)
+                    .context("invalid ready-image count in catalog")?,
+            })
         })
     }
 
@@ -770,11 +802,23 @@ mod tests {
     fn source_paths_round_trip() {
         let directory = tempfile::tempdir().expect("tempdir");
         let database = Database::open(directory.path().join("db")).expect("database");
+        assert_eq!(
+            database.catalog_summary().expect("empty summary"),
+            CatalogSummary::default()
+        );
         let images = directory.path().join("wallpapers");
         std::fs::create_dir(&images).expect("images directory");
         let inserted = database.add_source(&images).expect("add source");
         assert_eq!(inserted.path, images.canonicalize().expect("canonical"));
         assert_eq!(database.list_sources().expect("sources"), vec![inserted]);
+        assert_eq!(
+            database.catalog_summary().expect("source summary"),
+            CatalogSummary {
+                sources: 1,
+                images: 0,
+                ready_images: 0,
+            }
+        );
     }
 
     #[test]
